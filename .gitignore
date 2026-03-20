@@ -1,0 +1,53 @@
+# Build directories
+build/
+dist/
+bin/
+obj/
+out/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake-build-*/
+compile_commands.json
+
+# Make / test artifacts
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dll
+*.dylib
+*.exe
+*.out
+*.gcda
+*.gcno
+*.gcov
+*.profraw
+*.profdata
+*.log
+
+# Coverage reports
+coverage/
+coverage.*
+*.lcov
+
+# IDE / editor
+.vscode/
+.idea/
+*.suo
+*.user
+*.userosscache
+*.VC.db
+*.VC.opendb
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+git.txt
