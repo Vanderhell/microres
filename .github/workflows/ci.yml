@@ -1,0 +1,140 @@
+name: ci
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+
+jobs:
+  linux-matrix:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+        c_standard: [99, 11]
+        jitter: [ON, OFF]
+        short_enums: [OFF, ON]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -DMRES_BUILD_TESTS=ON
+          -DMRES_WITH_JITTER=${{ matrix.jitter }}
+          -DCMAKE_C_STANDARD=${{ matrix.c_standard }}
+          -DCMAKE_C_COMPILER=${{ matrix.compiler }}
+          -DCMAKE_C_FLAGS=${{ matrix.short_enums == 'ON' && '-fshort-enums' || '' }}
+      - name: Build
+        run: cmake --build build --parallel
+      - name: Runtime and compile-fail tests
+        run: ctest --test-dir build --output-on-failure
+
+  sanitizers:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        san: [address, undefined]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -DMRES_BUILD_TESTS=ON
+          -DCMAKE_C_COMPILER=clang
+          -DCMAKE_C_FLAGS="-fsanitize=${{ matrix.san }} -fno-omit-frame-pointer"
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=${{ matrix.san }}"
+      - name: Build
+        run: cmake --build build --parallel
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  sanitizers-combined:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -DMRES_BUILD_TESTS=ON
+          -DCMAKE_C_COMPILER=clang
+          -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+      - name: Build
+        run: cmake --build build --parallel
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  thread-sanitizer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -DMRES_BUILD_TESTS=ON
+          -DCMAKE_C_COMPILER=clang
+          -DCMAKE_C_FLAGS="-fsanitize=thread -fno-omit-frame-pointer"
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
+      - name: Build
+        run: cmake --build build --parallel
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  static-analysis:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y cppcheck clang-tidy
+      - name: Configure
+        run: cmake -S . -B build -DMRES_BUILD_TESTS=ON -DCMAKE_C_COMPILER=clang -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+      - name: cppcheck
+        run: cppcheck --enable=warning,style,performance,portability --error-exitcode=1 --inline-suppr --project=build/compile_commands.json
+      - name: clang-tidy
+        run: clang-tidy src/mres.c -- -Iinclude -Ibuild/generated/include -std=c99
+
+  consumers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure and build in-tree consumers
+        run: cmake -S . -B build -DMRES_BUILD_TESTS=ON && cmake --build build --parallel
+      - name: Install package
+        run: cmake --install build --prefix "$PWD/install"
+      - name: Build find_package consumer
+        run: >
+          cmake -S tests/consumers/find_package -B consumer-build
+          -DCMAKE_PREFIX_PATH="$PWD/install"
+          &&
+          cmake --build consumer-build --parallel
+
+  windows-msvc:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -DMRES_BUILD_TESTS=ON -G "Visual Studio 17 2022" -A x64
+      - name: Build
+        run: cmake --build build --config Release
+
+  arm-compile:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cpu: [cortex-m0, cortex-m4]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cross compiler
+        run: sudo apt-get update && sudo apt-get install -y gcc-arm-none-eabi
+      - name: Compile only
+        run: >
+          arm-none-eabi-gcc -c src/mres.c
+          -Iinclude
+          -I.
+          -std=c99
+          -Wall -Wextra -Wpedantic -Werror
+          -mcpu=${{ matrix.cpu }} -mthumb
