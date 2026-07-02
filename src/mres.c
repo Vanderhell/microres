@@ -6,9 +6,12 @@
 
 #include "mres.h"
 
-#define MRES_RETRY_MAGIC 0x4D525259u
-#define MRES_BREAKER_MAGIC 0x4D524252u
-#define MRES_RATELIMIT_MAGIC 0x4D52524Cu
+#define MRES_RETRY_MAGIC_READY 0x4D525259u
+#define MRES_RETRY_MAGIC_ACTIVE 0x4D525241u
+#define MRES_BREAKER_MAGIC_READY 0x4D524252u
+#define MRES_BREAKER_MAGIC_ACTIVE 0x4D524241u
+#define MRES_RATELIMIT_MAGIC_READY 0x4D52524Cu
+#define MRES_RATELIMIT_MAGIC_ACTIVE 0x4D525241u
 #define MRES_DEFAULT_JITTER_SEED 0x9E3779B9u
 
 static mres_err_t mres_validate_retry_policy(const mres_retry_policy_t *policy);
@@ -96,39 +99,57 @@ static uint32_t mres_apply_jitter(uint32_t delay, uint32_t random_value)
 #endif
 }
 
+static bool mres_retry_magic_valid(uint32_t magic)
+{
+    return (magic == MRES_RETRY_MAGIC_READY) || (magic == MRES_RETRY_MAGIC_ACTIVE);
+}
+
+static bool mres_breaker_magic_valid(uint32_t magic)
+{
+    return (magic == MRES_BREAKER_MAGIC_READY) || (magic == MRES_BREAKER_MAGIC_ACTIVE);
+}
+
+static bool mres_ratelimit_magic_valid(uint32_t magic)
+{
+    return (magic == MRES_RATELIMIT_MAGIC_READY) || (magic == MRES_RATELIMIT_MAGIC_ACTIVE);
+}
+
 static bool mres_retry_is_ready(const mres_retry_t *retry)
 {
-    return (retry != NULL) && (retry->magic == MRES_RETRY_MAGIC) && (retry->initialized != 0u);
+    return (retry != NULL) && mres_retry_magic_valid(retry->magic) && (retry->initialized != 0u);
 }
 
 static bool mres_breaker_is_ready(const mres_breaker_t *breaker)
 {
-    return (breaker != NULL) && (breaker->magic == MRES_BREAKER_MAGIC) &&
+    return (breaker != NULL) && mres_breaker_magic_valid(breaker->magic) &&
            (breaker->initialized != 0u);
 }
 
 static bool mres_ratelimit_is_ready(const mres_ratelimit_t *limiter)
 {
-    return (limiter != NULL) && (limiter->magic == MRES_RATELIMIT_MAGIC) &&
+    return (limiter != NULL) && mres_ratelimit_magic_valid(limiter->magic) &&
            (limiter->initialized != 0u);
 }
 
 static bool mres_retry_is_busy_instance(const mres_retry_t *retry)
 {
-    return mres_retry_is_ready(retry) && (retry->active != 0u) &&
+    return (retry != NULL) && (retry->magic == MRES_RETRY_MAGIC_ACTIVE) &&
+           (retry->initialized != 0u) && (retry->active != 0u) &&
            (mres_validate_retry_policy(&retry->policy) == MRES_OK);
 }
 
 static bool mres_breaker_is_busy_instance(const mres_breaker_t *breaker)
 {
-    return mres_breaker_is_ready(breaker) && (breaker->active != 0u) &&
+    return (breaker != NULL) && (breaker->magic == MRES_BREAKER_MAGIC_ACTIVE) &&
+           (breaker->initialized != 0u) && (breaker->active != 0u) &&
            mres_breaker_state_valid(breaker->state) &&
            (mres_validate_breaker_policy(&breaker->policy) == MRES_OK);
 }
 
 static bool mres_ratelimit_is_busy_instance(const mres_ratelimit_t *limiter)
 {
-    return mres_ratelimit_is_ready(limiter) && (limiter->active != 0u) &&
+    return (limiter != NULL) && (limiter->magic == MRES_RATELIMIT_MAGIC_ACTIVE) &&
+           (limiter->initialized != 0u) && (limiter->active != 0u) &&
            (mres_validate_ratelimit_policy(&limiter->policy) == MRES_OK);
 }
 
@@ -416,7 +437,7 @@ mres_err_t mres_retry_init(mres_retry_t *retry, const mres_retry_policy_t *polic
         return err;
     }
 
-    next_value.magic = MRES_RETRY_MAGIC;
+    next_value.magic = MRES_RETRY_MAGIC_READY;
     next_value.jitter_state = MRES_DEFAULT_JITTER_SEED;
     next_value.policy = *policy;
     next_value.last_operation_result = 0;
@@ -476,6 +497,7 @@ mres_err_t mres_retry_exec(
     }
 
     retry->active = 1u;
+    retry->magic = MRES_RETRY_MAGIC_ACTIVE;
     retry->attempts = 0u;
     retry->last_operation_result = 0;
 
@@ -492,6 +514,7 @@ mres_err_t mres_retry_exec(
 
         if (result == 0) {
             retry->active = 0u;
+            retry->magic = MRES_RETRY_MAGIC_READY;
             return MRES_OK;
         }
 
@@ -507,16 +530,19 @@ mres_err_t mres_retry_exec(
 
         if ((platform == NULL) || (platform->wait == NULL)) {
             retry->active = 0u;
+            retry->magic = MRES_RETRY_MAGIC_READY;
             return MRES_ERR_WAIT_REQUIRED;
         }
 
         if (platform->wait(platform->context, delay_ms) != 0) {
             retry->active = 0u;
+            retry->magic = MRES_RETRY_MAGIC_READY;
             return MRES_ERR_WAIT_FAILED;
         }
     }
 
     retry->active = 0u;
+    retry->magic = MRES_RETRY_MAGIC_READY;
     return MRES_ERR_EXHAUSTED;
 }
 
@@ -578,7 +604,7 @@ mres_err_t mres_breaker_init(mres_breaker_t *breaker, const mres_breaker_policy_
         return err;
     }
 
-    next_value.magic = MRES_BREAKER_MAGIC;
+    next_value.magic = MRES_BREAKER_MAGIC_READY;
     next_value.policy = *policy;
     next_value.opened_at_ms = 0u;
     next_value.state = MRES_BREAKER_CLOSED;
@@ -624,22 +650,26 @@ mres_err_t mres_breaker_call(
     }
 
     breaker->active = 1u;
+    breaker->magic = MRES_BREAKER_MAGIC_ACTIVE;
 
     if (breaker->state == MRES_BREAKER_OPEN) {
         err = mres_platform_clock_now(platform, &now_ms);
         if (err != MRES_OK) {
             breaker->active = 0u;
+            breaker->magic = MRES_BREAKER_MAGIC_READY;
             return err;
         }
 
         if (mres_elapsed_ms(breaker->opened_at_ms, now_ms) < breaker->policy.recovery_timeout_ms) {
             breaker->active = 0u;
+            breaker->magic = MRES_BREAKER_MAGIC_READY;
             return MRES_ERR_OPEN;
         }
 
         breaker->state = MRES_BREAKER_HALF_OPEN;
     } else if (breaker->state == MRES_BREAKER_HALF_OPEN) {
         breaker->active = 0u;
+        breaker->magic = MRES_BREAKER_MAGIC_READY;
         return MRES_ERR_INVALID;
     }
 
@@ -651,12 +681,14 @@ mres_err_t mres_breaker_call(
     if (result == 0) {
         (void)mres_breaker_close(breaker);
         breaker->active = 0u;
+        breaker->magic = MRES_BREAKER_MAGIC_READY;
         return MRES_OK;
     }
 
     if (breaker->state == MRES_BREAKER_HALF_OPEN) {
         err = mres_breaker_trip_now(breaker, platform);
         breaker->active = 0u;
+        breaker->magic = MRES_BREAKER_MAGIC_READY;
         return (err == MRES_OK) ? MRES_ERR_OP_FAILED : err;
     }
 
@@ -667,10 +699,12 @@ mres_err_t mres_breaker_call(
     if (breaker->failure_count >= breaker->policy.failure_threshold) {
         err = mres_breaker_trip_now(breaker, platform);
         breaker->active = 0u;
+        breaker->magic = MRES_BREAKER_MAGIC_READY;
         return (err == MRES_OK) ? MRES_ERR_OP_FAILED : err;
     }
 
     breaker->active = 0u;
+    breaker->magic = MRES_BREAKER_MAGIC_READY;
     return MRES_ERR_OP_FAILED;
 }
 
@@ -905,7 +939,7 @@ mres_err_t mres_ratelimit_init(
         return err;
     }
 
-    next_value.magic = MRES_RATELIMIT_MAGIC;
+    next_value.magic = MRES_RATELIMIT_MAGIC_READY;
     next_value.policy = *policy;
     next_value.last_refill_ms = now_ms;
     next_value.tokens = policy->max_tokens;
@@ -951,9 +985,11 @@ mres_err_t mres_ratelimit_acquire(
     }
 
     limiter->active = 1u;
+    limiter->magic = MRES_RATELIMIT_MAGIC_ACTIVE;
     err = mres_ratelimit_refill(limiter, platform);
     if (err != MRES_OK) {
         limiter->active = 0u;
+        limiter->magic = MRES_RATELIMIT_MAGIC_READY;
         return err;
     }
 
@@ -965,6 +1001,7 @@ mres_err_t mres_ratelimit_acquire(
     }
 
     limiter->active = 0u;
+    limiter->magic = MRES_RATELIMIT_MAGIC_READY;
     return MRES_OK;
 }
 
@@ -994,14 +1031,17 @@ mres_err_t mres_ratelimit_tokens(
     }
 
     limiter->active = 1u;
+    limiter->magic = MRES_RATELIMIT_MAGIC_ACTIVE;
     err = mres_ratelimit_refill(limiter, platform);
     if (err != MRES_OK) {
         limiter->active = 0u;
+        limiter->magic = MRES_RATELIMIT_MAGIC_READY;
         return err;
     }
 
     *tokens = limiter->tokens;
     limiter->active = 0u;
+    limiter->magic = MRES_RATELIMIT_MAGIC_READY;
     return MRES_OK;
 }
 
@@ -1024,14 +1064,17 @@ mres_err_t mres_ratelimit_reset(mres_ratelimit_t *limiter, const mres_platform_t
     }
 
     limiter->active = 1u;
+    limiter->magic = MRES_RATELIMIT_MAGIC_ACTIVE;
     err = mres_platform_clock_now(platform, &now_ms);
     if (err != MRES_OK) {
         limiter->active = 0u;
+        limiter->magic = MRES_RATELIMIT_MAGIC_READY;
         return err;
     }
 
     limiter->tokens = limiter->policy.max_tokens;
     limiter->last_refill_ms = now_ms;
     limiter->active = 0u;
+    limiter->magic = MRES_RATELIMIT_MAGIC_READY;
     return MRES_OK;
 }
