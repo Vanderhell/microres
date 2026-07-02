@@ -1,435 +1,1011 @@
 /*
- * microres — Implementation.
+ * microres - Implementation.
  *
  * SPDX-License-Identifier: MIT
- * https://github.com/Vanderhell/microres
  */
 
 #include "mres.h"
 
-/* ── Internal helpers ──────────────────────────────────────────────────── */
+#define MRES_RETRY_MAGIC 0x4D525259u
+#define MRES_BREAKER_MAGIC 0x4D524252u
+#define MRES_RATELIMIT_MAGIC 0x4D52524Cu
+#define MRES_DEFAULT_JITTER_SEED 0x9E3779B9u
 
-/** Elapsed time handling uint32_t wrap-around. */
-static inline uint32_t elapsed_ms(uint32_t start, uint32_t now)
-{
-    return now - start;  /* works correctly with unsigned wrap */
-}
-
-/** Clamp a value to a maximum. */
-static inline uint32_t clamp_u32(uint32_t value, uint32_t max)
-{
-    return (max > 0 && value > max) ? max : value;
-}
-
-/** Minimum of two uint16_t values. */
-static inline uint16_t min_u16(uint16_t a, uint16_t b)
-{
-    return (a < b) ? a : b;
-}
-
-#if MRES_ENABLE_JITTER
-/**
- * Simple deterministic jitter: ±25% based on a seed.
- *
- * We use a lightweight xorshift to generate pseudo-random jitter from
- * the clock value + attempt number. This avoids needing rand() or a
- * seed state. The jitter is "good enough" to decorrelate retries from
- * multiple devices — it does not need to be cryptographic.
- */
-static uint32_t apply_jitter(uint32_t delay, uint32_t seed)
-{
-    /* xorshift32 */
-    uint32_t x = seed;
-    if (x == 0) x = 0xDEADBEEF;
-    x ^= x << 13;
-    x ^= x >> 17;
-    x ^= x << 5;
-
-    /* ±25%: jitter range is delay/2, centered on delay */
-    uint32_t quarter = delay / 4;
-    if (quarter == 0) return delay;
-
-    uint32_t jitter = x % (quarter * 2);  /* 0 .. delay/2 */
-    return delay - quarter + jitter;       /* delay ± 25% */
-}
+#ifdef MRES_ASSERT
+#define MRES_DIAG_ASSERT(expr)                                                     \
+    do {                                                                           \
+        int mres_assert_once_ = ((expr) ? 1 : 0);                                  \
+        if (mres_assert_once_ == 0) {                                              \
+            MRES_ASSERT(mres_assert_once_ != 0);                                   \
+        }                                                                          \
+    } while (0)
+#else
+#define MRES_DIAG_ASSERT(expr) do { (void)(expr); } while (0)
 #endif
 
-/* ── Error strings ─────────────────────────────────────────────────────── */
-
-const char *mres_err_str(mres_err_t err)
+static uint32_t mres_elapsed_ms(uint32_t start, uint32_t now)
 {
-    switch (err) {
-    case MRES_OK:              return "ok";
-    case MRES_ERR_NULL:        return "null pointer";
-    case MRES_ERR_EXHAUSTED:   return "retries exhausted";
-    case MRES_ERR_OPEN:        return "circuit breaker open";
-    case MRES_ERR_RATE_LIMITED: return "rate limited";
-    case MRES_ERR_OP_FAILED:   return "operation failed";
-    case MRES_ERR_INVALID:     return "invalid configuration";
-    default:                   return "unknown error";
-    }
+    return now - start;
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * Retry
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-mres_err_t mres_retry_init(mres_retry_t *retry, const mres_retry_policy_t *policy)
+static uint32_t mres_clamp_delay(uint32_t value, uint32_t cap)
 {
-    MRES_CHECK_NULL(retry);
-    MRES_CHECK_NULL(policy);
+    if ((cap != 0u) && (value > cap)) {
+        return cap;
+    }
 
-    if (policy->max_attempts == 0) {
+    return value;
+}
+
+static uint32_t mres_saturating_mul_u32(uint32_t left, uint32_t right)
+{
+    if ((left == 0u) || (right == 0u)) {
+        return 0u;
+    }
+
+    if (left > (UINT32_MAX / right)) {
+        return UINT32_MAX;
+    }
+
+    return left * right;
+}
+
+static uint32_t mres_next_jitter(uint32_t *state)
+{
+    uint32_t value = *state;
+
+    if (value == 0u) {
+        value = MRES_DEFAULT_JITTER_SEED;
+    }
+
+    value ^= value << 13;
+    value ^= value >> 17;
+    value ^= value << 5;
+    *state = value;
+
+    return value;
+}
+
+static uint32_t mres_apply_jitter(uint32_t delay, uint32_t random_value)
+{
+#if MRES_ENABLE_JITTER
+    uint32_t quarter;
+    uint32_t range;
+    uint32_t offset;
+
+    if (delay == 0u) {
+        return 0u;
+    }
+
+    quarter = delay / 4u;
+    if (quarter == 0u) {
+        return delay;
+    }
+
+    range = quarter * 2u;
+    offset = random_value % (range + 1u);
+    return (delay - quarter) + offset;
+#else
+    (void)random_value;
+    return delay;
+#endif
+}
+
+static bool mres_retry_is_ready(const mres_retry_t *retry)
+{
+    return (retry != NULL) && (retry->magic == MRES_RETRY_MAGIC) && (retry->initialized != 0u);
+}
+
+static bool mres_breaker_is_ready(const mres_breaker_t *breaker)
+{
+    return (breaker != NULL) && (breaker->magic == MRES_BREAKER_MAGIC) &&
+           (breaker->initialized != 0u);
+}
+
+static bool mres_ratelimit_is_ready(const mres_ratelimit_t *limiter)
+{
+    return (limiter != NULL) && (limiter->magic == MRES_RATELIMIT_MAGIC) &&
+           (limiter->initialized != 0u);
+}
+
+static mres_err_t mres_validate_retry_policy(const mres_retry_policy_t *policy)
+{
+    if (policy == NULL) {
+        MRES_DIAG_ASSERT(policy != NULL);
+        return MRES_ERR_NULL;
+    }
+
+    if (policy->max_attempts == 0u) {
         return MRES_ERR_INVALID;
     }
 
-    retry->policy     = policy;
-    retry->attempts   = 0;
-    retry->last_error = 0;
+    if (policy->max_attempts > (uint8_t)MRES_MAX_ATTEMPTS) {
+        return MRES_ERR_RANGE;
+    }
+
+    if ((policy->strategy != MRES_BACKOFF_FIXED) &&
+        (policy->strategy != MRES_BACKOFF_LINEAR) &&
+        (policy->strategy != MRES_BACKOFF_EXPONENTIAL)) {
+        return MRES_ERR_INVALID;
+    }
+
+    if ((policy->jitter != 0u) && (policy->jitter != 1u)) {
+        return MRES_ERR_INVALID;
+    }
+
+#if !MRES_ENABLE_JITTER
+    if (policy->jitter != 0u) {
+        return MRES_ERR_UNSUPPORTED;
+    }
+#endif
 
     return MRES_OK;
 }
 
-uint32_t mres_delay_calc(const mres_retry_policy_t *policy, uint8_t attempt,
-                         mres_clock_fn clock)
+static mres_err_t mres_validate_breaker_policy(const mres_breaker_policy_t *policy)
 {
-    if (policy == NULL) return 0;
-
-    uint32_t delay;
-
-    switch (policy->strategy) {
-    case MRES_BACKOFF_LINEAR:
-        delay = policy->base_delay_ms * ((uint32_t)attempt + 1);
-        break;
-
-    case MRES_BACKOFF_EXPONENTIAL: {
-        delay = policy->base_delay_ms;
-        for (uint8_t i = 0; i < attempt && delay < UINT32_MAX / 2; i++) {
-            delay *= 2;
-        }
-        break;
-    }
-
-    case MRES_BACKOFF_FIXED:
-    default:
-        delay = policy->base_delay_ms;
-        break;
-    }
-
-    /* Apply cap */
-    delay = clamp_u32(delay, policy->max_delay_ms);
-
-#if MRES_ENABLE_JITTER
-    if (policy->jitter) {
-        uint32_t seed = (clock != NULL) ? clock() : 0;
-        seed ^= (uint32_t)attempt * 2654435761U;  /* Knuth multiplicative hash */
-        delay = apply_jitter(delay, seed);
-        /* Re-apply cap after jitter (jitter can push above) */
-        delay = clamp_u32(delay, policy->max_delay_ms);
-    }
-#else
-    (void)clock;
-#endif
-
-    return delay;
-}
-
-int mres_retry_exec(mres_retry_t *retry, mres_op_fn op, void *ctx,
-                    mres_clock_fn clock, mres_sleep_fn sleep)
-{
-    if (retry == NULL || op == NULL || retry->policy == NULL) {
+    if (policy == NULL) {
+        MRES_DIAG_ASSERT(policy != NULL);
         return MRES_ERR_NULL;
     }
 
-    const mres_retry_policy_t *policy = retry->policy;
-    retry->attempts = 0;
+    if (policy->failure_threshold == 0u) {
+        return MRES_ERR_INVALID;
+    }
 
-    for (uint8_t i = 0; i < policy->max_attempts; i++) {
-        retry->attempts = i + 1;
+    if (policy->recovery_timeout_ms == 0u) {
+        return MRES_ERR_INVALID;
+    }
 
-        int result = op(ctx);
+    if (policy->half_open_max_calls != 1u) {
+        return MRES_ERR_UNSUPPORTED;
+    }
+
+    return MRES_OK;
+}
+
+static mres_err_t mres_validate_ratelimit_policy(const mres_ratelimit_policy_t *policy)
+{
+    if (policy == NULL) {
+        MRES_DIAG_ASSERT(policy != NULL);
+        return MRES_ERR_NULL;
+    }
+
+    if (policy->max_tokens == 0u) {
+        return MRES_ERR_INVALID;
+    }
+
+    if (policy->refill_ms == 0u) {
+        return MRES_ERR_INVALID;
+    }
+
+    if (policy->refill_count == 0u) {
+        return MRES_ERR_INVALID;
+    }
+
+    return MRES_OK;
+}
+
+static mres_err_t mres_retry_delay_value(mres_retry_t *retry, uint8_t attempt, uint32_t *delay_ms)
+{
+    uint32_t delay = 0u;
+
+    if (retry == NULL) {
+        MRES_DIAG_ASSERT(retry != NULL);
+        return MRES_ERR_NULL;
+    }
+
+    if (delay_ms == NULL) {
+        MRES_DIAG_ASSERT(delay_ms != NULL);
+        return MRES_ERR_NULL;
+    }
+
+    if (!mres_retry_is_ready(retry)) {
+        return MRES_ERR_INVALID;
+    }
+
+    switch (retry->policy.strategy) {
+    case MRES_BACKOFF_FIXED:
+        delay = retry->policy.base_delay_ms;
+        break;
+
+    case MRES_BACKOFF_LINEAR:
+        delay = mres_saturating_mul_u32(retry->policy.base_delay_ms, (uint32_t)attempt + 1u);
+        break;
+
+    case MRES_BACKOFF_EXPONENTIAL: {
+        uint32_t multiplier = 1u;
+        uint8_t shift_count = attempt;
+
+        while (shift_count > 0u) {
+            if (multiplier > (UINT32_MAX / 2u)) {
+                multiplier = UINT32_MAX;
+                break;
+            }
+
+            multiplier *= 2u;
+            shift_count--;
+        }
+
+        delay = mres_saturating_mul_u32(retry->policy.base_delay_ms, multiplier);
+        break;
+    }
+
+    default:
+        return MRES_ERR_INVALID;
+    }
+
+    delay = mres_clamp_delay(delay, retry->policy.max_delay_ms);
+
+#if MRES_ENABLE_JITTER
+    if (retry->policy.jitter != 0u) {
+        delay = mres_apply_jitter(delay, mres_next_jitter(&retry->jitter_state));
+        delay = mres_clamp_delay(delay, retry->policy.max_delay_ms);
+    }
+#endif
+
+    *delay_ms = delay;
+    return MRES_OK;
+}
+
+static bool mres_breaker_state_valid(uint8_t state)
+{
+    return (state == MRES_BREAKER_CLOSED) || (state == MRES_BREAKER_OPEN) ||
+           (state == MRES_BREAKER_HALF_OPEN);
+}
+
+static mres_err_t mres_platform_clock_now(const mres_platform_t *platform, uint32_t *now_ms)
+{
+    if (platform == NULL) {
+        MRES_DIAG_ASSERT(platform != NULL);
+        return MRES_ERR_NULL;
+    }
+
+    if (platform->clock == NULL) {
+        MRES_DIAG_ASSERT(platform->clock != NULL);
+        return MRES_ERR_NULL;
+    }
+
+    if (now_ms == NULL) {
+        MRES_DIAG_ASSERT(now_ms != NULL);
+        return MRES_ERR_NULL;
+    }
+
+    *now_ms = platform->clock(platform->context);
+    return MRES_OK;
+}
+
+static mres_err_t mres_breaker_trip_now(mres_breaker_t *breaker, const mres_platform_t *platform)
+{
+    uint32_t now_ms = 0u;
+    mres_err_t err = mres_platform_clock_now(platform, &now_ms);
+
+    if (err != MRES_OK) {
+        return err;
+    }
+
+    breaker->state = MRES_BREAKER_OPEN;
+    breaker->opened_at_ms = now_ms;
+    return MRES_OK;
+}
+
+static mres_err_t mres_breaker_close(mres_breaker_t *breaker)
+{
+    breaker->state = MRES_BREAKER_CLOSED;
+    breaker->failure_count = 0u;
+    breaker->opened_at_ms = 0u;
+    return MRES_OK;
+}
+
+static mres_err_t mres_ratelimit_refill(mres_ratelimit_t *limiter, const mres_platform_t *platform)
+{
+    uint32_t now_ms = 0u;
+    uint32_t elapsed = 0u;
+    uint32_t intervals = 0u;
+    uint32_t missing = 0u;
+    uint32_t intervals_needed = 0u;
+    uint32_t advanced = 0u;
+    mres_err_t err = MRES_OK;
+
+    err = mres_platform_clock_now(platform, &now_ms);
+    if (err != MRES_OK) {
+        return err;
+    }
+
+    elapsed = mres_elapsed_ms(limiter->last_refill_ms, now_ms);
+    if (elapsed < limiter->policy.refill_ms) {
+        return MRES_OK;
+    }
+
+    intervals = elapsed / limiter->policy.refill_ms;
+    advanced = elapsed - (elapsed % limiter->policy.refill_ms);
+
+    if (limiter->tokens >= limiter->policy.max_tokens) {
+        limiter->tokens = limiter->policy.max_tokens;
+        limiter->last_refill_ms += advanced;
+        return MRES_OK;
+    }
+
+    missing = (uint32_t)limiter->policy.max_tokens - (uint32_t)limiter->tokens;
+    intervals_needed = (missing + (uint32_t)limiter->policy.refill_count - 1u) /
+                       (uint32_t)limiter->policy.refill_count;
+
+    if (intervals >= intervals_needed) {
+        limiter->tokens = limiter->policy.max_tokens;
+    } else {
+        limiter->tokens = (uint16_t)((uint32_t)limiter->tokens +
+                                     (intervals * (uint32_t)limiter->policy.refill_count));
+    }
+
+    limiter->last_refill_ms += advanced;
+    return MRES_OK;
+}
+
+const char *mres_err_str(mres_err_t err)
+{
+    switch (err) {
+    case MRES_OK:
+        return "ok";
+    case MRES_ERR_NULL:
+        return "null argument";
+    case MRES_ERR_INVALID:
+        return "invalid state or configuration";
+    case MRES_ERR_RANGE:
+        return "value out of range";
+    case MRES_ERR_BUSY:
+        return "instance busy";
+    case MRES_ERR_EXHAUSTED:
+        return "attempts exhausted";
+    case MRES_ERR_OPEN:
+        return "breaker open";
+    case MRES_ERR_OP_FAILED:
+        return "operation failed";
+    case MRES_ERR_WAIT_REQUIRED:
+        return "wait callback required";
+    case MRES_ERR_WAIT_FAILED:
+        return "wait callback failed";
+    case MRES_ERR_UNSUPPORTED:
+        return "unsupported configuration";
+    default:
+        return "unknown error";
+    }
+}
+
+mres_err_t mres_retry_init(mres_retry_t *retry, const mres_retry_policy_t *policy)
+{
+    mres_retry_t next_value;
+    mres_err_t err = MRES_OK;
+
+    if (retry == NULL) {
+        MRES_DIAG_ASSERT(retry != NULL);
+        return MRES_ERR_NULL;
+    }
+
+    if (mres_retry_is_ready(retry) && (retry->active != 0u)) {
+        return MRES_ERR_BUSY;
+    }
+
+    err = mres_validate_retry_policy(policy);
+    if (err != MRES_OK) {
+        return err;
+    }
+
+    next_value.magic = MRES_RETRY_MAGIC;
+    next_value.jitter_state = MRES_DEFAULT_JITTER_SEED;
+    next_value.policy = *policy;
+    next_value.last_operation_result = 0;
+    next_value.attempts = 0u;
+    next_value.initialized = 1u;
+    next_value.active = 0u;
+    next_value.reserved0 = 0u;
+    *retry = next_value;
+
+    return MRES_OK;
+}
+
+mres_err_t mres_retry_seed(mres_retry_t *retry, uint32_t seed)
+{
+    if (retry == NULL) {
+        MRES_DIAG_ASSERT(retry != NULL);
+        return MRES_ERR_NULL;
+    }
+
+    if (!mres_retry_is_ready(retry)) {
+        return MRES_ERR_INVALID;
+    }
+
+    if (retry->active != 0u) {
+        return MRES_ERR_BUSY;
+    }
+
+    retry->jitter_state = (seed == 0u) ? MRES_DEFAULT_JITTER_SEED : seed;
+    return MRES_OK;
+}
+
+mres_err_t mres_retry_exec(
+    mres_retry_t *retry,
+    mres_op_fn operation,
+    void *operation_context,
+    const mres_platform_t *platform,
+    int *operation_result)
+{
+    uint8_t attempt = 0u;
+
+    if (retry == NULL) {
+        MRES_DIAG_ASSERT(retry != NULL);
+        return MRES_ERR_NULL;
+    }
+
+    if (operation == NULL) {
+        MRES_DIAG_ASSERT(operation != NULL);
+        return MRES_ERR_NULL;
+    }
+
+    if (!mres_retry_is_ready(retry)) {
+        return MRES_ERR_INVALID;
+    }
+
+    if (retry->active != 0u) {
+        return MRES_ERR_BUSY;
+    }
+
+    retry->active = 1u;
+    retry->attempts = 0u;
+    retry->last_operation_result = 0;
+
+    for (attempt = 0u; attempt < retry->policy.max_attempts; ++attempt) {
+        uint32_t delay_ms = 0u;
+        int result = operation(operation_context);
+
+        retry->attempts = (uint8_t)(attempt + 1u);
+        retry->last_operation_result = result;
+
+        if (operation_result != NULL) {
+            *operation_result = result;
+        }
+
         if (result == 0) {
-            retry->last_error = 0;
+            retry->active = 0u;
             return MRES_OK;
         }
 
-        retry->last_error = result;
+        if ((uint8_t)(attempt + 1u) >= retry->policy.max_attempts) {
+            break;
+        }
 
-        /* Don't sleep after the last attempt */
-        if (i + 1 < policy->max_attempts) {
-            uint32_t delay = mres_delay_calc(policy, i, clock);
+        (void)mres_retry_delay_value(retry, attempt, &delay_ms);
 
-            if (sleep != NULL && delay > 0) {
-                sleep(delay);
-            } else if (sleep == NULL) {
-                /* No sleep function — return control to caller.
-                 * In non-blocking mode, this lets the caller manage timing.
-                 * We continue to the next attempt immediately. */
-            }
+        if (delay_ms == 0u) {
+            continue;
+        }
+
+        if ((platform == NULL) || (platform->wait == NULL)) {
+            retry->active = 0u;
+            return MRES_ERR_WAIT_REQUIRED;
+        }
+
+        if (platform->wait(platform->context, delay_ms) != 0) {
+            retry->active = 0u;
+            return MRES_ERR_WAIT_FAILED;
         }
     }
 
+    retry->active = 0u;
     return MRES_ERR_EXHAUSTED;
 }
 
 mres_err_t mres_retry_reset(mres_retry_t *retry)
 {
-    MRES_CHECK_NULL(retry);
-    retry->attempts   = 0;
-    retry->last_error = 0;
-    return MRES_OK;
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * Circuit Breaker
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-mres_err_t mres_breaker_init(mres_breaker_t *br, const mres_breaker_policy_t *policy)
-{
-    MRES_CHECK_NULL(br);
-    MRES_CHECK_NULL(policy);
-
-    if (policy->failure_threshold == 0) {
-        return MRES_ERR_INVALID;
-    }
-
-    br->policy          = policy;
-    br->state           = MRES_BREAKER_CLOSED;
-    br->failure_count   = 0;
-    br->half_open_calls = 0;
-    br->opened_at       = 0;
-
-    return MRES_OK;
-}
-
-/** Internal: transition to OPEN state. */
-static void breaker_trip(mres_breaker_t *br, uint32_t now)
-{
-    br->state     = MRES_BREAKER_OPEN;
-    br->opened_at = now;
-}
-
-/** Internal: transition to CLOSED state. */
-static void breaker_close(mres_breaker_t *br)
-{
-    br->state           = MRES_BREAKER_CLOSED;
-    br->failure_count   = 0;
-    br->half_open_calls = 0;
-}
-
-/** Internal: check if recovery timeout has elapsed. */
-static bool breaker_timeout_elapsed(const mres_breaker_t *br, uint32_t now)
-{
-    return elapsed_ms(br->opened_at, now) >= br->policy->recovery_timeout_ms;
-}
-
-int mres_breaker_call(mres_breaker_t *br, mres_op_fn op, void *ctx,
-                      mres_clock_fn clock)
-{
-    if (br == NULL || op == NULL || clock == NULL || br->policy == NULL) {
+    if (retry == NULL) {
+        MRES_DIAG_ASSERT(retry != NULL);
         return MRES_ERR_NULL;
     }
 
-    uint32_t now = clock();
-
-    /* State evaluation */
-    switch (br->state) {
-    case MRES_BREAKER_OPEN:
-        if (breaker_timeout_elapsed(br, now)) {
-            /* Transition to HALF_OPEN */
-            br->state           = MRES_BREAKER_HALF_OPEN;
-            br->half_open_calls = 0;
-        } else {
-            return MRES_ERR_OPEN;
-        }
-        /* fall through to HALF_OPEN */
-        /* fall through */
-
-    case MRES_BREAKER_HALF_OPEN:
-        if (br->state == MRES_BREAKER_HALF_OPEN &&
-            br->half_open_calls >= br->policy->half_open_max_calls) {
-            /* Already made max probe calls, still waiting */
-            return MRES_ERR_OPEN;
-        }
-        br->half_open_calls++;
-        break;
-
-    case MRES_BREAKER_CLOSED:
-    default:
-        break;
-    }
-
-    /* Execute the operation */
-    int result = op(ctx);
-
-    if (result == 0) {
-        /* Success */
-        if (br->state == MRES_BREAKER_HALF_OPEN) {
-            breaker_close(br);
-        } else {
-            br->failure_count = 0;
-        }
-        return MRES_OK;
-    }
-
-    /* Failure */
-    if (br->state == MRES_BREAKER_HALF_OPEN) {
-        /* Probe failed — go back to OPEN */
-        breaker_trip(br, now);
-    } else {
-        /* CLOSED: increment failure count */
-        br->failure_count++;
-        if (br->failure_count >= br->policy->failure_threshold) {
-            breaker_trip(br, now);
-        }
-    }
-
-    return result;  /* pass through the operation's error code */
-}
-
-mres_breaker_state_t mres_breaker_state(const mres_breaker_t *br)
-{
-    if (br == NULL) return MRES_BREAKER_CLOSED;
-    return br->state;
-}
-
-const char *mres_breaker_state_name(const mres_breaker_t *br)
-{
-    if (br == NULL) return "?";
-    switch (br->state) {
-    case MRES_BREAKER_CLOSED:    return "CLOSED";
-    case MRES_BREAKER_OPEN:      return "OPEN";
-    case MRES_BREAKER_HALF_OPEN: return "HALF_OPEN";
-    default:                     return "?";
-    }
-}
-
-uint32_t mres_breaker_remaining_ms(const mres_breaker_t *br, mres_clock_fn clock)
-{
-    if (br == NULL || clock == NULL || br->state != MRES_BREAKER_OPEN) {
-        return 0;
-    }
-
-    uint32_t elapsed = elapsed_ms(br->opened_at, clock());
-    if (elapsed >= br->policy->recovery_timeout_ms) {
-        return 0;
-    }
-
-    return br->policy->recovery_timeout_ms - elapsed;
-}
-
-mres_err_t mres_breaker_reset(mres_breaker_t *br)
-{
-    MRES_CHECK_NULL(br);
-    breaker_close(br);
-    return MRES_OK;
-}
-
-mres_err_t mres_breaker_report_success(mres_breaker_t *br)
-{
-    MRES_CHECK_NULL(br);
-    if (br->state == MRES_BREAKER_HALF_OPEN) {
-        breaker_close(br);
-    } else {
-        br->failure_count = 0;
-    }
-    return MRES_OK;
-}
-
-mres_err_t mres_breaker_report_failure(mres_breaker_t *br, mres_clock_fn clock)
-{
-    MRES_CHECK_NULL(br);
-    if (clock == NULL) return MRES_ERR_NULL;
-
-    uint32_t now = clock();
-
-    if (br->state == MRES_BREAKER_HALF_OPEN) {
-        breaker_trip(br, now);
-    } else {
-        br->failure_count++;
-        if (br->failure_count >= br->policy->failure_threshold) {
-            breaker_trip(br, now);
-        }
-    }
-
-    return MRES_OK;
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * Rate Limiter
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-/** Internal: refill tokens based on elapsed time. */
-static void ratelimit_refill(mres_ratelimit_t *rl, uint32_t now)
-{
-    uint32_t elapsed = elapsed_ms(rl->last_refill, now);
-
-    if (elapsed >= rl->policy->refill_ms) {
-        uint32_t intervals = elapsed / rl->policy->refill_ms;
-        uint32_t add = intervals * rl->policy->refill_count;
-
-        uint32_t new_tokens = (uint32_t)rl->tokens + add;
-        rl->tokens = min_u16((uint16_t)(new_tokens > UINT16_MAX ? UINT16_MAX : new_tokens),
-                             rl->policy->max_tokens);
-
-        /* Advance last_refill by whole intervals only (preserve remainder) */
-        rl->last_refill += intervals * rl->policy->refill_ms;
-    }
-}
-
-mres_err_t mres_ratelimit_init(mres_ratelimit_t *rl,
-                               const mres_ratelimit_policy_t *policy,
-                               mres_clock_fn clock)
-{
-    MRES_CHECK_NULL(rl);
-    MRES_CHECK_NULL(policy);
-    MRES_CHECK_NULL(clock);
-
-    if (policy->max_tokens == 0 || policy->refill_ms == 0) {
+    if (!mres_retry_is_ready(retry)) {
         return MRES_ERR_INVALID;
     }
 
-    rl->policy      = policy;
-    rl->tokens      = policy->max_tokens;
-    rl->last_refill = clock();
+    if (retry->active != 0u) {
+        return MRES_ERR_BUSY;
+    }
+
+    retry->attempts = 0u;
+    retry->last_operation_result = 0;
+    retry->jitter_state = MRES_DEFAULT_JITTER_SEED;
+    return MRES_OK;
+}
+
+mres_err_t mres_delay_calc(mres_retry_t *retry, uint8_t attempt, uint32_t *delay_ms)
+{
+    if (retry == NULL) {
+        MRES_DIAG_ASSERT(retry != NULL);
+        return MRES_ERR_NULL;
+    }
+
+    if (!mres_retry_is_ready(retry)) {
+        return MRES_ERR_INVALID;
+    }
+
+    if (retry->active != 0u) {
+        return MRES_ERR_BUSY;
+    }
+
+    return mres_retry_delay_value(retry, attempt, delay_ms);
+}
+
+mres_err_t mres_breaker_init(mres_breaker_t *breaker, const mres_breaker_policy_t *policy)
+{
+    mres_breaker_t next_value;
+    mres_err_t err = MRES_OK;
+
+    if (breaker == NULL) {
+        MRES_DIAG_ASSERT(breaker != NULL);
+        return MRES_ERR_NULL;
+    }
+
+    if (mres_breaker_is_ready(breaker) && (breaker->active != 0u)) {
+        return MRES_ERR_BUSY;
+    }
+
+    err = mres_validate_breaker_policy(policy);
+    if (err != MRES_OK) {
+        return err;
+    }
+
+    next_value.magic = MRES_BREAKER_MAGIC;
+    next_value.policy = *policy;
+    next_value.opened_at_ms = 0u;
+    next_value.state = MRES_BREAKER_CLOSED;
+    next_value.failure_count = 0u;
+    next_value.initialized = 1u;
+    next_value.active = 0u;
+    *breaker = next_value;
 
     return MRES_OK;
 }
 
-bool mres_ratelimit_acquire(mres_ratelimit_t *rl, uint16_t count,
-                            mres_clock_fn clock)
+mres_err_t mres_breaker_call(
+    mres_breaker_t *breaker,
+    mres_op_fn operation,
+    void *operation_context,
+    const mres_platform_t *platform,
+    int *operation_result)
 {
-    if (rl == NULL || clock == NULL || rl->policy == NULL || count == 0) {
-        return false;
+    int result = 0;
+    uint32_t now_ms = 0u;
+    mres_err_t err = MRES_OK;
+
+    if (breaker == NULL) {
+        MRES_DIAG_ASSERT(breaker != NULL);
+        return MRES_ERR_NULL;
     }
 
-    ratelimit_refill(rl, clock());
-
-    if (rl->tokens >= count) {
-        rl->tokens -= count;
-        return true;
+    if (operation == NULL) {
+        MRES_DIAG_ASSERT(operation != NULL);
+        return MRES_ERR_NULL;
     }
 
-    return false;
+    if (!mres_breaker_is_ready(breaker)) {
+        return MRES_ERR_INVALID;
+    }
+
+    if (breaker->active != 0u) {
+        return MRES_ERR_BUSY;
+    }
+
+    if (!mres_breaker_state_valid(breaker->state)) {
+        return MRES_ERR_INVALID;
+    }
+
+    breaker->active = 1u;
+
+    if (breaker->state == MRES_BREAKER_OPEN) {
+        err = mres_platform_clock_now(platform, &now_ms);
+        if (err != MRES_OK) {
+            breaker->active = 0u;
+            return err;
+        }
+
+        if (mres_elapsed_ms(breaker->opened_at_ms, now_ms) < breaker->policy.recovery_timeout_ms) {
+            breaker->active = 0u;
+            return MRES_ERR_OPEN;
+        }
+
+        breaker->state = MRES_BREAKER_HALF_OPEN;
+    } else if (breaker->state == MRES_BREAKER_HALF_OPEN) {
+        breaker->active = 0u;
+        return MRES_ERR_INVALID;
+    }
+
+    result = operation(operation_context);
+    if (operation_result != NULL) {
+        *operation_result = result;
+    }
+
+    if (result == 0) {
+        (void)mres_breaker_close(breaker);
+        breaker->active = 0u;
+        return MRES_OK;
+    }
+
+    if (breaker->state == MRES_BREAKER_HALF_OPEN) {
+        err = mres_breaker_trip_now(breaker, platform);
+        breaker->active = 0u;
+        return (err == MRES_OK) ? MRES_ERR_OP_FAILED : err;
+    }
+
+    if (breaker->failure_count < UINT8_MAX) {
+        breaker->failure_count++;
+    }
+
+    if (breaker->failure_count >= breaker->policy.failure_threshold) {
+        err = mres_breaker_trip_now(breaker, platform);
+        breaker->active = 0u;
+        return (err == MRES_OK) ? MRES_ERR_OP_FAILED : err;
+    }
+
+    breaker->active = 0u;
+    return MRES_ERR_OP_FAILED;
 }
 
-uint16_t mres_ratelimit_tokens(mres_ratelimit_t *rl, mres_clock_fn clock)
+mres_err_t mres_breaker_get_state(const mres_breaker_t *breaker, mres_breaker_state_t *state)
 {
-    if (rl == NULL || clock == NULL || rl->policy == NULL) {
-        return 0;
+    if (breaker == NULL) {
+        MRES_DIAG_ASSERT(breaker != NULL);
+        return MRES_ERR_NULL;
     }
 
-    ratelimit_refill(rl, clock());
-    return rl->tokens;
+    if (state == NULL) {
+        MRES_DIAG_ASSERT(state != NULL);
+        return MRES_ERR_NULL;
+    }
+
+    if (!mres_breaker_is_ready(breaker)) {
+        return MRES_ERR_INVALID;
+    }
+
+    if (!mres_breaker_state_valid(breaker->state)) {
+        return MRES_ERR_INVALID;
+    }
+
+    *state = breaker->state;
+    return MRES_OK;
 }
 
-mres_err_t mres_ratelimit_reset(mres_ratelimit_t *rl, mres_clock_fn clock)
+mres_err_t mres_breaker_state_name(const mres_breaker_t *breaker, const char **name)
 {
-    MRES_CHECK_NULL(rl);
-    MRES_CHECK_NULL(clock);
+    if (breaker == NULL) {
+        MRES_DIAG_ASSERT(breaker != NULL);
+        return MRES_ERR_NULL;
+    }
 
-    rl->tokens      = rl->policy->max_tokens;
-    rl->last_refill = clock();
+    if (name == NULL) {
+        MRES_DIAG_ASSERT(name != NULL);
+        return MRES_ERR_NULL;
+    }
 
+    if (!mres_breaker_is_ready(breaker)) {
+        return MRES_ERR_INVALID;
+    }
+
+    switch (breaker->state) {
+    case MRES_BREAKER_CLOSED:
+        *name = "closed";
+        return MRES_OK;
+
+    case MRES_BREAKER_OPEN:
+        *name = "open";
+        return MRES_OK;
+
+    case MRES_BREAKER_HALF_OPEN:
+        *name = "half_open";
+        return MRES_OK;
+
+    default:
+        return MRES_ERR_INVALID;
+    }
+}
+
+mres_err_t mres_breaker_remaining_ms(
+    const mres_breaker_t *breaker,
+    const mres_platform_t *platform,
+    uint32_t *remaining_ms,
+    bool *is_open)
+{
+    uint32_t now_ms = 0u;
+    uint32_t elapsed = 0u;
+    mres_err_t err = MRES_OK;
+
+    if (breaker == NULL) {
+        MRES_DIAG_ASSERT(breaker != NULL);
+        return MRES_ERR_NULL;
+    }
+
+    if ((remaining_ms == NULL) || (is_open == NULL)) {
+        MRES_DIAG_ASSERT((remaining_ms != NULL) && (is_open != NULL));
+        return MRES_ERR_NULL;
+    }
+
+    if (!mres_breaker_is_ready(breaker)) {
+        return MRES_ERR_INVALID;
+    }
+
+    if (!mres_breaker_state_valid(breaker->state)) {
+        return MRES_ERR_INVALID;
+    }
+
+    if (breaker->state != MRES_BREAKER_OPEN) {
+        *remaining_ms = 0u;
+        *is_open = false;
+        return MRES_OK;
+    }
+
+    err = mres_platform_clock_now(platform, &now_ms);
+    if (err != MRES_OK) {
+        return err;
+    }
+
+    elapsed = mres_elapsed_ms(breaker->opened_at_ms, now_ms);
+    *is_open = true;
+
+    if (elapsed >= breaker->policy.recovery_timeout_ms) {
+        *remaining_ms = 0u;
+        return MRES_OK;
+    }
+
+    *remaining_ms = breaker->policy.recovery_timeout_ms - elapsed;
+    return MRES_OK;
+}
+
+mres_err_t mres_breaker_reset(mres_breaker_t *breaker)
+{
+    if (breaker == NULL) {
+        MRES_DIAG_ASSERT(breaker != NULL);
+        return MRES_ERR_NULL;
+    }
+
+    if (!mres_breaker_is_ready(breaker)) {
+        return MRES_ERR_INVALID;
+    }
+
+    if (breaker->active != 0u) {
+        return MRES_ERR_BUSY;
+    }
+
+    if (!mres_breaker_state_valid(breaker->state)) {
+        return MRES_ERR_INVALID;
+    }
+
+    return mres_breaker_close(breaker);
+}
+
+mres_err_t mres_breaker_report_success(mres_breaker_t *breaker)
+{
+    if (breaker == NULL) {
+        MRES_DIAG_ASSERT(breaker != NULL);
+        return MRES_ERR_NULL;
+    }
+
+    if (!mres_breaker_is_ready(breaker)) {
+        return MRES_ERR_INVALID;
+    }
+
+    if (breaker->active != 0u) {
+        return MRES_ERR_BUSY;
+    }
+
+    switch (breaker->state) {
+    case MRES_BREAKER_CLOSED:
+        breaker->failure_count = 0u;
+        return MRES_OK;
+
+    case MRES_BREAKER_HALF_OPEN:
+        return mres_breaker_close(breaker);
+
+    case MRES_BREAKER_OPEN:
+        return MRES_OK;
+
+    default:
+        return MRES_ERR_INVALID;
+    }
+}
+
+mres_err_t mres_breaker_report_failure(mres_breaker_t *breaker, const mres_platform_t *platform)
+{
+    mres_err_t err = MRES_OK;
+
+    if (breaker == NULL) {
+        MRES_DIAG_ASSERT(breaker != NULL);
+        return MRES_ERR_NULL;
+    }
+
+    if (!mres_breaker_is_ready(breaker)) {
+        return MRES_ERR_INVALID;
+    }
+
+    if (breaker->active != 0u) {
+        return MRES_ERR_BUSY;
+    }
+
+    switch (breaker->state) {
+    case MRES_BREAKER_CLOSED:
+        if (breaker->failure_count < UINT8_MAX) {
+            breaker->failure_count++;
+        }
+
+        if (breaker->failure_count >= breaker->policy.failure_threshold) {
+            return mres_breaker_trip_now(breaker, platform);
+        }
+
+        return MRES_OK;
+
+    case MRES_BREAKER_HALF_OPEN:
+        err = mres_breaker_trip_now(breaker, platform);
+        return err;
+
+    case MRES_BREAKER_OPEN:
+        return MRES_OK;
+
+    default:
+        return MRES_ERR_INVALID;
+    }
+}
+
+mres_err_t mres_ratelimit_init(
+    mres_ratelimit_t *limiter,
+    const mres_ratelimit_policy_t *policy,
+    const mres_platform_t *platform)
+{
+    uint32_t now_ms = 0u;
+    mres_ratelimit_t next_value;
+    mres_err_t err = MRES_OK;
+
+    if (limiter == NULL) {
+        MRES_DIAG_ASSERT(limiter != NULL);
+        return MRES_ERR_NULL;
+    }
+
+    if (mres_ratelimit_is_ready(limiter) && (limiter->active != 0u)) {
+        return MRES_ERR_BUSY;
+    }
+
+    err = mres_validate_ratelimit_policy(policy);
+    if (err != MRES_OK) {
+        return err;
+    }
+
+    err = mres_platform_clock_now(platform, &now_ms);
+    if (err != MRES_OK) {
+        return err;
+    }
+
+    next_value.magic = MRES_RATELIMIT_MAGIC;
+    next_value.policy = *policy;
+    next_value.last_refill_ms = now_ms;
+    next_value.tokens = policy->max_tokens;
+    next_value.initialized = 1u;
+    next_value.active = 0u;
+    *limiter = next_value;
+
+    return MRES_OK;
+}
+
+mres_err_t mres_ratelimit_acquire(
+    mres_ratelimit_t *limiter,
+    uint16_t count,
+    const mres_platform_t *platform,
+    bool *allowed)
+{
+    mres_err_t err = MRES_OK;
+
+    if (limiter == NULL) {
+        MRES_DIAG_ASSERT(limiter != NULL);
+        return MRES_ERR_NULL;
+    }
+
+    if (allowed == NULL) {
+        MRES_DIAG_ASSERT(allowed != NULL);
+        return MRES_ERR_NULL;
+    }
+
+    if (!mres_ratelimit_is_ready(limiter)) {
+        return MRES_ERR_INVALID;
+    }
+
+    if (limiter->active != 0u) {
+        return MRES_ERR_BUSY;
+    }
+
+    if (count == 0u) {
+        return MRES_ERR_INVALID;
+    }
+
+    if (count > limiter->policy.max_tokens) {
+        return MRES_ERR_RANGE;
+    }
+
+    limiter->active = 1u;
+    err = mres_ratelimit_refill(limiter, platform);
+    if (err != MRES_OK) {
+        limiter->active = 0u;
+        return err;
+    }
+
+    if (limiter->tokens >= count) {
+        limiter->tokens = (uint16_t)(limiter->tokens - count);
+        *allowed = true;
+    } else {
+        *allowed = false;
+    }
+
+    limiter->active = 0u;
+    return MRES_OK;
+}
+
+mres_err_t mres_ratelimit_tokens(
+    mres_ratelimit_t *limiter,
+    const mres_platform_t *platform,
+    uint16_t *tokens)
+{
+    mres_err_t err = MRES_OK;
+
+    if (limiter == NULL) {
+        MRES_DIAG_ASSERT(limiter != NULL);
+        return MRES_ERR_NULL;
+    }
+
+    if (tokens == NULL) {
+        MRES_DIAG_ASSERT(tokens != NULL);
+        return MRES_ERR_NULL;
+    }
+
+    if (!mres_ratelimit_is_ready(limiter)) {
+        return MRES_ERR_INVALID;
+    }
+
+    if (limiter->active != 0u) {
+        return MRES_ERR_BUSY;
+    }
+
+    limiter->active = 1u;
+    err = mres_ratelimit_refill(limiter, platform);
+    if (err != MRES_OK) {
+        limiter->active = 0u;
+        return err;
+    }
+
+    *tokens = limiter->tokens;
+    limiter->active = 0u;
+    return MRES_OK;
+}
+
+mres_err_t mres_ratelimit_reset(mres_ratelimit_t *limiter, const mres_platform_t *platform)
+{
+    uint32_t now_ms = 0u;
+    mres_err_t err = MRES_OK;
+
+    if (limiter == NULL) {
+        MRES_DIAG_ASSERT(limiter != NULL);
+        return MRES_ERR_NULL;
+    }
+
+    if (!mres_ratelimit_is_ready(limiter)) {
+        return MRES_ERR_INVALID;
+    }
+
+    if (limiter->active != 0u) {
+        return MRES_ERR_BUSY;
+    }
+
+    limiter->active = 1u;
+    err = mres_platform_clock_now(platform, &now_ms);
+    if (err != MRES_OK) {
+        limiter->active = 0u;
+        return err;
+    }
+
+    limiter->tokens = limiter->policy.max_tokens;
+    limiter->last_refill_ms = now_ms;
+    limiter->active = 0u;
     return MRES_OK;
 }
