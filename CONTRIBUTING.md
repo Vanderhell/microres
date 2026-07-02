@@ -1,42 +1,25 @@
-# Contributing to microres
+# Contributing
 
-Thank you for considering a contribution.
+## Baseline rules
 
-## Scope
+- keep the library compatible with C99
+- preserve caller-owned, fixed-memory design
+- do not add heap allocation
+- do not add hidden globals
+- do not add async schedulers, thread pools, coroutine layers, or RTOS abstraction layers
+- do not weaken tests to make a change pass
+- do not tag or release unless explicitly requested
 
-Contributions that align with the project philosophy:
+## Contract rules
 
-- Bug fixes and edge case handling.
-- Documentation and example improvements.
-- Test coverage improvements.
-- Platform porting notes.
-- Performance improvements without added complexity.
+- keep library status codes separate from callback result domains
+- preserve fixed-width public ABI types
+- preserve copied-policy semantics
+- keep same-instance busy guards intact
+- document any supported behavior before claiming it in README or docs
 
-Out of scope:
+## Build and test expectations
 
-- Async/coroutine retry. Use `mres_delay_calc()` and your own scheduler.
-- Thread-safe wrappers. These are platform-specific.
-- Dynamic allocation. The library is zero-alloc by design.
-- External dependencies. Zero dependencies by design.
-
-## How to contribute
-
-1. Open an issue first.
-2. Fork and branch (`fix/description` or `feat/description`).
-3. Write tests for your changes.
-4. Follow the code style (C99, 4-space indent, `mres_` prefix, `const` correctness).
-5. Submit a PR referencing the issue.
-
-## Testing
-
-```bash
-cd tests
-make
-```
-
-All tests must pass on GCC and Clang with `-Wall -Wextra -Wpedantic -Werror`.
-
-## License
-
-By contributing, you agree that your contributions will be licensed under
-the MIT License.
+- CMake packaging and consumer fixtures should remain functional
+- compile-fail tests should use repository-defined diagnostics where possible
+- shared-instance threading claims require explicit external-locking documentation and tests
