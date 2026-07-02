@@ -13,9 +13,12 @@ if(compiler_name STREQUAL "cl")
             /c
             "${source_file}"
             "/Fo${object_file}"
-            "/I${SOURCE_DIR}/include"
-            "/I${MRES_GENERATED_INCLUDE_DIR}"
-            "/I${SOURCE_DIR}/tests/compile_fail/include"
+            /I
+            "${SOURCE_DIR}/include"
+            /I
+            "${MRES_GENERATED_INCLUDE_DIR}"
+            /I
+            "${SOURCE_DIR}/tests/compile_fail/include"
         RESULT_VARIABLE compile_result
         OUTPUT_VARIABLE compile_stdout
         ERROR_VARIABLE compile_stderr
@@ -28,9 +31,12 @@ else()
             "${source_file}"
             -o
             "${object_file}"
-            -I"${SOURCE_DIR}/include"
-            -I"${MRES_GENERATED_INCLUDE_DIR}"
-            -I"${SOURCE_DIR}/tests/compile_fail/include"
+            -I
+            "${SOURCE_DIR}/include"
+            -I
+            "${MRES_GENERATED_INCLUDE_DIR}"
+            -I
+            "${SOURCE_DIR}/tests/compile_fail/include"
             -std=c99
         RESULT_VARIABLE compile_result
         OUTPUT_VARIABLE compile_stdout
