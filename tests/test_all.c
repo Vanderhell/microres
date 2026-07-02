@@ -1,692 +1,583 @@
-/*
- * microres test suite.
- *
- * Build: gcc -std=c99 -Wall -Wextra -I../include ../src/mres.c test_all.c -o test_all
- * Run:   ./test_all
- */
-
 #include "mres.h"
+
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
 
-/* ── Minimal test framework ────────────────────────────────────────────── */
+typedef bool (*test_fn)(void);
 
-static int tests_run = 0, tests_passed = 0, tests_failed = 0;
+typedef struct {
+    int run;
+    int passed;
+    int failed;
+} harness_totals_t;
 
-#define TEST(name) static void name(void)
-#define RUN_TEST(name) do {                                     \
-    tests_run++;                                                \
-    printf("  %-55s ", #name);                                  \
-    name();                                                     \
-    printf("PASS\n");                                           \
-    tests_passed++;                                             \
-} while (0)
+static harness_totals_t g_totals = { 0, 0, 0 };
 
-#define ASSERT_EQ(expected, actual) do {                        \
-    if ((expected) != (actual)) {                               \
-        printf("FAIL\n    %s:%d: expected %d, got %d\n",       \
-               __FILE__, __LINE__, (int)(expected), (int)(actual)); \
-        tests_failed++; return;                                 \
-    }                                                           \
-} while (0)
+#define CHECK_TRUE(expr)                                                           \
+    do {                                                                           \
+        if (!(expr)) {                                                             \
+            printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #expr);                 \
+            return false;                                                          \
+        }                                                                          \
+    } while (0)
 
-#define ASSERT_TRUE(expr) do {                                  \
-    if (!(expr)) {                                              \
-        printf("FAIL\n    %s:%d: expected true\n",              \
-               __FILE__, __LINE__);                             \
-        tests_failed++; return;                                 \
-    }                                                           \
-} while (0)
+#define CHECK_ERR(expected, actual)                                                \
+    do {                                                                           \
+        mres_err_t actual_once_ = (actual);                                        \
+        if ((expected) != actual_once_) {                                          \
+            printf("FAIL %s:%d: expected %ld got %ld\n",                           \
+                   __FILE__,                                                       \
+                   __LINE__,                                                       \
+                   (long)(expected),                                               \
+                   (long)actual_once_);                                            \
+            return false;                                                          \
+        }                                                                          \
+    } while (0)
 
-#define ASSERT_FALSE(expr) do {                                 \
-    if ((expr)) {                                               \
-        printf("FAIL\n    %s:%d: expected false\n",             \
-               __FILE__, __LINE__);                             \
-        tests_failed++; return;                                 \
-    }                                                           \
-} while (0)
+#define CHECK_INT(expected, actual)                                                \
+    do {                                                                           \
+        int actual_once_ = (actual);                                               \
+        if ((expected) != actual_once_) {                                          \
+            printf("FAIL %s:%d: expected %d got %d\n",                             \
+                   __FILE__, __LINE__, (expected), actual_once_);                  \
+            return false;                                                          \
+        }                                                                          \
+    } while (0)
 
-#define ASSERT_STR_EQ(expected, actual) do {                    \
-    if (strcmp((expected), (actual)) != 0) {                     \
-        printf("FAIL\n    %s:%d: expected \"%s\", got \"%s\"\n",\
-               __FILE__, __LINE__, (expected), (actual));       \
-        tests_failed++; return;                                 \
-    }                                                           \
-} while (0)
+#define CHECK_U32(expected, actual)                                                \
+    do {                                                                           \
+        uint32_t actual_once_ = (actual);                                          \
+        if ((expected) != actual_once_) {                                          \
+            printf("FAIL %s:%d: expected %lu got %lu\n",                           \
+                   __FILE__,                                                       \
+                   __LINE__,                                                       \
+                   (unsigned long)(expected),                                      \
+                   (unsigned long)actual_once_);                                   \
+            return false;                                                          \
+        }                                                                          \
+    } while (0)
 
-#define ASSERT_GE(val, minimum) do {                            \
-    if ((int)(val) < (int)(minimum)) {                          \
-        printf("FAIL\n    %s:%d: %d < %d\n",                   \
-               __FILE__, __LINE__, (int)(val), (int)(minimum)); \
-        tests_failed++; return;                                 \
-    }                                                           \
-} while (0)
+#define CHECK_U16(expected, actual)                                                \
+    do {                                                                           \
+        uint16_t actual_once_ = (actual);                                          \
+        if ((expected) != actual_once_) {                                          \
+            printf("FAIL %s:%d: expected %u got %u\n",                             \
+                   __FILE__, __LINE__, (unsigned)(expected), (unsigned)actual_once_); \
+            return false;                                                          \
+        }                                                                          \
+    } while (0)
 
-#define ASSERT_LE(val, maximum) do {                            \
-    if ((int)(val) > (int)(maximum)) {                          \
-        printf("FAIL\n    %s:%d: %d > %d\n",                   \
-               __FILE__, __LINE__, (int)(val), (int)(maximum)); \
-        tests_failed++; return;                                 \
-    }                                                           \
-} while (0)
+#define CHECK_BOOL(expected, actual)                                               \
+    do {                                                                           \
+        bool actual_once_ = (actual);                                              \
+        if ((expected) != actual_once_) {                                          \
+            printf("FAIL %s:%d: expected %s got %s\n",                             \
+                   __FILE__,                                                       \
+                   __LINE__,                                                       \
+                   (expected) ? "true" : "false",                                  \
+                   actual_once_ ? "true" : "false");                               \
+            return false;                                                          \
+        }                                                                          \
+    } while (0)
 
-/* ── Mock clock and sleep ──────────────────────────────────────────────── */
+#define CHECK_STR(expected, actual)                                                \
+    do {                                                                           \
+        const char *actual_once_ = (actual);                                       \
+        if (strcmp((expected), actual_once_) != 0) {                               \
+            printf("FAIL %s:%d: expected \"%s\" got \"%s\"\n",                     \
+                   __FILE__, __LINE__, (expected), actual_once_);                  \
+            return false;                                                          \
+        }                                                                          \
+    } while (0)
 
-static uint32_t mock_time_ms = 0;
-static uint32_t total_sleep_ms = 0;
+static bool run_test(const char *name, test_fn fn)
+{
+    bool passed = false;
 
-static uint32_t mock_clock(void)          { return mock_time_ms; }
-static void mock_sleep(uint32_t ms)       { mock_time_ms += ms; total_sleep_ms += ms; }
+    g_totals.run++;
+    printf("  %-48s ", name);
+    passed = fn();
 
-static void reset_mocks(void) {
-    mock_time_ms   = 1000;  /* start at 1s to avoid zero-edge cases */
-    total_sleep_ms = 0;
+    if (passed) {
+        g_totals.passed++;
+        printf("PASS\n");
+    } else {
+        g_totals.failed++;
+    }
+
+    return passed;
 }
 
-/* ── Mock operations ───────────────────────────────────────────────────── */
+typedef struct {
+    uint32_t now_ms;
+    uint32_t total_wait_ms;
+    int wait_status;
+    int wait_calls;
+    mres_retry_t *retry_for_reentry;
+    mres_ratelimit_t *limiter_for_reentry;
+    const mres_platform_t *platform_for_reentry;
+} mock_clock_t;
 
-static int op_call_count = 0;
-static int op_fail_until = 0;   /* fail this many times, then succeed */
+typedef struct {
+    int fail_count;
+    int call_count;
+    int fixed_result;
+    mres_retry_t *retry_for_reentry;
+    mres_breaker_t *breaker_for_reentry;
+    const mres_platform_t *platform_for_reentry;
+} mock_op_t;
 
-static int mock_op_succeed(void *ctx) {
-    (void)ctx;
-    op_call_count++;
+static int op_succeeds(void *context);
+
+static uint32_t mock_clock_now(void *context)
+{
+    mock_clock_t *clock = (mock_clock_t *)context;
+
+    if (clock->limiter_for_reentry != NULL) {
+        bool allowed = true;
+        (void)mres_ratelimit_acquire(clock->limiter_for_reentry, 1u, clock->platform_for_reentry,
+                                     &allowed);
+    }
+
+    return clock->now_ms;
+}
+
+static int mock_wait_fn(void *context, uint32_t delay_ms)
+{
+    mock_clock_t *clock = (mock_clock_t *)context;
+    int result = 99;
+
+    clock->wait_calls++;
+    clock->total_wait_ms += delay_ms;
+    clock->now_ms += delay_ms;
+
+    if (clock->retry_for_reentry != NULL) {
+        (void)mres_retry_reset(clock->retry_for_reentry);
+        (void)mres_retry_exec(clock->retry_for_reentry, op_succeeds, NULL, NULL, &result);
+    }
+
+    return clock->wait_status;
+}
+
+static int op_succeeds(void *context)
+{
+    mock_op_t *op = (mock_op_t *)context;
+    op->call_count++;
     return 0;
 }
 
-static int mock_op_fail(void *ctx) {
-    (void)ctx;
-    op_call_count++;
-    return -1;
+static int op_fails(void *context)
+{
+    mock_op_t *op = (mock_op_t *)context;
+    op->call_count++;
+    return op->fixed_result;
 }
 
-static int mock_op_fail_then_succeed(void *ctx) {
-    (void)ctx;
-    op_call_count++;
-    if (op_call_count <= op_fail_until) {
-        return -1;
+static int op_fail_then_succeed(void *context)
+{
+    mock_op_t *op = (mock_op_t *)context;
+    op->call_count++;
+
+    if (op->call_count <= op->fail_count) {
+        return op->fixed_result;
+    }
+
+    return 0;
+}
+
+static int retry_reentrant_operation(void *context)
+{
+    mock_op_t *op = (mock_op_t *)context;
+    int nested_result = 42;
+    mres_err_t nested_status = MRES_OK;
+
+    op->call_count++;
+    nested_status =
+        mres_retry_exec(op->retry_for_reentry, op_succeeds, context, NULL, &nested_result);
+    if (nested_status != MRES_ERR_BUSY) {
+        return -1000;
+    }
+    return op->fixed_result;
+}
+
+static int breaker_reentrant_operation(void *context)
+{
+    mock_op_t *op = (mock_op_t *)context;
+    int nested_result = 42;
+    mres_err_t nested_status = MRES_OK;
+
+    op->call_count++;
+    nested_status = mres_breaker_call(op->breaker_for_reentry, op_succeeds, context,
+                                      op->platform_for_reentry, &nested_result);
+    if (nested_status != MRES_ERR_BUSY) {
+        return -1000;
     }
     return 0;
 }
 
-static void reset_op(void) {
-    op_call_count  = 0;
-    op_fail_until  = 0;
+static mres_retry_policy_t retry_policy(uint8_t attempts, uint32_t base, uint32_t cap,
+                                        uint8_t strategy, uint8_t jitter)
+{
+    mres_retry_policy_t policy;
+
+    policy.max_attempts = attempts;
+    policy.strategy = strategy;
+    policy.jitter = jitter;
+    policy.reserved0 = 0u;
+    policy.base_delay_ms = base;
+    policy.max_delay_ms = cap;
+
+    return policy;
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * Tests: Retry
- * ═══════════════════════════════════════════════════════════════════════════ */
+static mres_breaker_policy_t breaker_policy(uint8_t failures, uint32_t timeout_ms)
+{
+    mres_breaker_policy_t policy;
 
-TEST(test_retry_init) {
-    mres_retry_policy_t policy = { .max_attempts = 3, .base_delay_ms = 100,
-                                   .strategy = MRES_BACKOFF_FIXED };
+    policy.failure_threshold = failures;
+    policy.half_open_max_calls = 1u;
+    policy.reserved0 = 0u;
+    policy.reserved1 = 0u;
+    policy.recovery_timeout_ms = timeout_ms;
+
+    return policy;
+}
+
+static mres_ratelimit_policy_t limiter_policy(uint16_t max_tokens, uint16_t refill_count,
+                                              uint32_t refill_ms)
+{
+    mres_ratelimit_policy_t policy;
+
+    policy.max_tokens = max_tokens;
+    policy.refill_count = refill_count;
+    policy.refill_ms = refill_ms;
+
+    return policy;
+}
+
+static bool test_retry_policy_validation(void)
+{
     mres_retry_t retry;
-    ASSERT_EQ(MRES_OK, mres_retry_init(&retry, &policy));
-    ASSERT_EQ(0, retry.attempts);
+    mres_retry_policy_t invalid_strategy = retry_policy(3u, 10u, 0u, 9u, 0u);
+    mres_retry_policy_t invalid_attempts = retry_policy((uint8_t)(MRES_MAX_ATTEMPTS + 1), 10u, 0u,
+                                                        MRES_BACKOFF_FIXED, 0u);
+
+    CHECK_ERR(MRES_ERR_INVALID, mres_retry_init(&retry, &invalid_strategy));
+    CHECK_ERR(MRES_ERR_RANGE, mres_retry_init(&retry, &invalid_attempts));
+    return true;
 }
 
-TEST(test_retry_init_null) {
-    mres_retry_policy_t policy = { .max_attempts = 3 };
+static bool test_retry_policy_copy_and_seed(void)
+{
+    mres_retry_t left;
+    mres_retry_t right;
+    mres_retry_policy_t policy = retry_policy(3u, 1000u, 0u, MRES_BACKOFF_FIXED, 1u);
+    uint32_t left_delay = 0u;
+    uint32_t right_delay = 0u;
+
+    CHECK_ERR(MRES_OK, mres_retry_init(&left, &policy));
+    CHECK_ERR(MRES_OK, mres_retry_init(&right, &policy));
+    CHECK_ERR(MRES_OK, mres_retry_seed(&left, 123u));
+    CHECK_ERR(MRES_OK, mres_retry_seed(&right, 123u));
+
+    policy.base_delay_ms = 10u;
+
+    CHECK_ERR(MRES_OK, mres_delay_calc(&left, 0u, &left_delay));
+    CHECK_ERR(MRES_OK, mres_delay_calc(&right, 0u, &right_delay));
+    CHECK_U32(left_delay, right_delay);
+
+    CHECK_ERR(MRES_OK, mres_retry_seed(&right, 456u));
+    CHECK_ERR(MRES_OK, mres_delay_calc(&right, 0u, &right_delay));
+    CHECK_TRUE(left_delay != right_delay);
+    return true;
+}
+
+static bool test_retry_arithmetic_saturation(void)
+{
     mres_retry_t retry;
-    ASSERT_EQ(MRES_ERR_NULL, mres_retry_init(NULL, &policy));
-    ASSERT_EQ(MRES_ERR_NULL, mres_retry_init(&retry, NULL));
+    uint32_t delay_ms = 0u;
+    mres_retry_policy_t linear = retry_policy(3u, UINT32_MAX, 100u, MRES_BACKOFF_LINEAR, 0u);
+    mres_retry_policy_t exponential =
+        retry_policy(3u, UINT32_MAX / 2u, 0u, MRES_BACKOFF_EXPONENTIAL, 0u);
+
+    CHECK_ERR(MRES_OK, mres_retry_init(&retry, &linear));
+    CHECK_ERR(MRES_OK, mres_delay_calc(&retry, 1u, &delay_ms));
+    CHECK_U32(100u, delay_ms);
+
+    CHECK_ERR(MRES_OK, mres_retry_init(&retry, &exponential));
+    CHECK_ERR(MRES_OK, mres_delay_calc(&retry, 3u, &delay_ms));
+    CHECK_U32(UINT32_MAX, delay_ms);
+    return true;
 }
 
-TEST(test_retry_init_zero_attempts) {
-    mres_retry_policy_t policy = { .max_attempts = 0 };
+static bool test_retry_exec_wait_contracts(void)
+{
     mres_retry_t retry;
-    ASSERT_EQ(MRES_ERR_INVALID, mres_retry_init(&retry, &policy));
+    mres_retry_policy_t policy = retry_policy(2u, 50u, 0u, MRES_BACKOFF_FIXED, 0u);
+    mock_clock_t clock = { 10u, 0u, 0, 0, NULL, NULL, NULL };
+    mock_op_t op = { 1, 0, 77, NULL, NULL, NULL };
+    mres_platform_t platform = { &clock, mock_clock_now, mock_wait_fn };
+    int operation_result = -1;
+
+    CHECK_ERR(MRES_OK, mres_retry_init(&retry, &policy));
+    CHECK_ERR(MRES_ERR_WAIT_REQUIRED,
+              mres_retry_exec(&retry, op_fail_then_succeed, &op, NULL, &operation_result));
+    CHECK_INT(77, operation_result);
+
+    op.call_count = 0;
+    clock.wait_status = -1;
+    CHECK_ERR(MRES_ERR_WAIT_FAILED,
+              mres_retry_exec(&retry, op_fail_then_succeed, &op, &platform, &operation_result));
+    CHECK_INT(77, operation_result);
+    return true;
 }
 
-TEST(test_retry_success_first_attempt) {
-    reset_mocks(); reset_op();
-    mres_retry_policy_t policy = { .max_attempts = 3, .base_delay_ms = 100,
-                                   .strategy = MRES_BACKOFF_FIXED };
+static bool test_retry_exec_result_domain(void)
+{
     mres_retry_t retry;
-    mres_retry_init(&retry, &policy);
-    ASSERT_EQ(MRES_OK, mres_retry_exec(&retry, mock_op_succeed, NULL,
-                                         mock_clock, mock_sleep));
-    ASSERT_EQ(1, retry.attempts);
-    ASSERT_EQ(1, op_call_count);
-    ASSERT_EQ(0, (int)total_sleep_ms);  /* no sleep needed */
+    mres_retry_policy_t policy = retry_policy(1u, 0u, 0u, MRES_BACKOFF_FIXED, 0u);
+    mock_op_t op = { 5, 0, MRES_ERR_OPEN, NULL, NULL, NULL };
+    int operation_result = 99;
+
+    CHECK_ERR(MRES_OK, mres_retry_init(&retry, &policy));
+    CHECK_ERR(MRES_ERR_EXHAUSTED,
+              mres_retry_exec(&retry, op_fails, &op, NULL, &operation_result));
+    CHECK_INT(MRES_ERR_OPEN, operation_result);
+    return true;
 }
 
-TEST(test_retry_success_after_failures) {
-    reset_mocks(); reset_op();
-    op_fail_until = 2;
-    mres_retry_policy_t policy = { .max_attempts = 5, .base_delay_ms = 100,
-                                   .strategy = MRES_BACKOFF_FIXED };
+static bool test_retry_same_instance_recursion_and_reset(void)
+{
     mres_retry_t retry;
-    mres_retry_init(&retry, &policy);
-    ASSERT_EQ(MRES_OK, mres_retry_exec(&retry, mock_op_fail_then_succeed, NULL,
-                                         mock_clock, mock_sleep));
-    ASSERT_EQ(3, retry.attempts);
-    ASSERT_EQ(3, op_call_count);
+    mres_retry_policy_t policy = retry_policy(2u, 10u, 0u, MRES_BACKOFF_FIXED, 0u);
+    mock_clock_t clock = { 0u, 0u, 0, 0, &retry, NULL, NULL };
+    mock_op_t op = { 0, 0, 5, &retry, NULL, NULL };
+    mres_platform_t platform = { &clock, mock_clock_now, mock_wait_fn };
+    int operation_result = 0;
+
+    CHECK_ERR(MRES_OK, mres_retry_init(&retry, &policy));
+    CHECK_ERR(MRES_ERR_EXHAUSTED,
+              mres_retry_exec(&retry, retry_reentrant_operation, &op, &platform, &operation_result));
+    CHECK_ERR(MRES_OK, mres_retry_reset(&retry));
+    return true;
 }
 
-TEST(test_retry_exhausted) {
-    reset_mocks(); reset_op();
-    mres_retry_policy_t policy = { .max_attempts = 3, .base_delay_ms = 100,
-                                   .strategy = MRES_BACKOFF_FIXED };
-    mres_retry_t retry;
-    mres_retry_init(&retry, &policy);
-    ASSERT_EQ(MRES_ERR_EXHAUSTED, mres_retry_exec(&retry, mock_op_fail, NULL,
-                                                    mock_clock, mock_sleep));
-    ASSERT_EQ(3, retry.attempts);
-    ASSERT_EQ(3, op_call_count);
+static bool test_retry_nested_independent_instances(void)
+{
+    mres_retry_t outer_retry;
+    mres_retry_t inner_retry;
+    mres_retry_policy_t outer_policy = retry_policy(2u, 0u, 0u, MRES_BACKOFF_FIXED, 0u);
+    mres_retry_policy_t inner_policy = retry_policy(1u, 0u, 0u, MRES_BACKOFF_FIXED, 0u);
+    mock_op_t inner_op = { 0, 0, 0, NULL, NULL, NULL };
+    int inner_result = -1;
+
+    CHECK_ERR(MRES_OK, mres_retry_init(&outer_retry, &outer_policy));
+    CHECK_ERR(MRES_OK, mres_retry_init(&inner_retry, &inner_policy));
+    CHECK_ERR(MRES_OK, mres_retry_exec(&inner_retry, op_succeeds, &inner_op, NULL, &inner_result));
+    CHECK_INT(0, inner_result);
+    return true;
 }
 
-TEST(test_retry_single_attempt) {
-    reset_mocks(); reset_op();
-    mres_retry_policy_t policy = { .max_attempts = 1, .base_delay_ms = 100,
-                                   .strategy = MRES_BACKOFF_FIXED };
-    mres_retry_t retry;
-    mres_retry_init(&retry, &policy);
-    ASSERT_EQ(MRES_ERR_EXHAUSTED, mres_retry_exec(&retry, mock_op_fail, NULL,
-                                                    mock_clock, mock_sleep));
-    ASSERT_EQ(1, op_call_count);
+static bool test_breaker_policy_and_state_queries(void)
+{
+    mres_breaker_t breaker;
+    mres_breaker_policy_t unsupported = breaker_policy(1u, 100u);
+    mres_breaker_policy_t supported = breaker_policy(2u, 100u);
+    mres_breaker_state_t state = 99u;
+    const char *name = NULL;
+
+    unsupported.half_open_max_calls = 2u;
+    CHECK_ERR(MRES_ERR_UNSUPPORTED, mres_breaker_init(&breaker, &unsupported));
+    CHECK_ERR(MRES_ERR_INVALID, mres_breaker_get_state(&breaker, &state));
+
+    CHECK_ERR(MRES_OK, mres_breaker_init(&breaker, &supported));
+    CHECK_ERR(MRES_OK, mres_breaker_get_state(&breaker, &state));
+    CHECK_ERR(MRES_OK, mres_breaker_state_name(&breaker, &name));
+    CHECK_U32(MRES_BREAKER_CLOSED, state);
+    CHECK_STR("closed", name);
+    return true;
 }
 
-TEST(test_retry_reset) {
-    mres_retry_policy_t policy = { .max_attempts = 3 };
-    mres_retry_t retry;
-    mres_retry_init(&retry, &policy);
-    retry.attempts = 3;
-    retry.last_error = -1;
-    ASSERT_EQ(MRES_OK, mres_retry_reset(&retry));
-    ASSERT_EQ(0, retry.attempts);
-    ASSERT_EQ(0, retry.last_error);
+static bool test_breaker_fail_closed_and_result_domain(void)
+{
+    mres_breaker_t breaker;
+    mres_breaker_policy_t policy = breaker_policy(1u, 50u);
+    mock_clock_t clock = { 100u, 0u, 0, 0, NULL, NULL, NULL };
+    mock_op_t op = { 0, 0, MRES_ERR_OPEN, NULL, NULL, NULL };
+    mres_platform_t platform = { &clock, mock_clock_now, mock_wait_fn };
+    int result = 0;
+
+    CHECK_ERR(MRES_OK, mres_breaker_init(&breaker, &policy));
+    breaker.state = 9u;
+    CHECK_ERR(MRES_ERR_INVALID, mres_breaker_call(&breaker, op_fails, &op, &platform, &result));
+    CHECK_INT(0, op.call_count);
+
+    CHECK_ERR(MRES_OK, mres_breaker_init(&breaker, &policy));
+    CHECK_ERR(MRES_ERR_OP_FAILED,
+              mres_breaker_call(&breaker, op_fails, &op, &platform, &result));
+    CHECK_INT(MRES_ERR_OPEN, result);
+    return true;
 }
 
-/* ── Delay calculation tests ──────────────────────────────────────────── */
+static bool test_breaker_open_timing_and_manual_report(void)
+{
+    mres_breaker_t breaker;
+    mres_breaker_policy_t policy = breaker_policy(1u, 50u);
+    mock_clock_t clock = { 100u, 0u, 0, 0, NULL, NULL, NULL };
+    mock_op_t op = { 0, 0, 5, NULL, NULL, NULL };
+    mres_platform_t platform = { &clock, mock_clock_now, mock_wait_fn };
+    uint32_t remaining_ms = 0u;
+    bool is_open = false;
 
-TEST(test_delay_fixed) {
-    mres_retry_policy_t policy = { .max_attempts = 5, .base_delay_ms = 200,
-                                   .strategy = MRES_BACKOFF_FIXED, .jitter = false };
-    ASSERT_EQ(200, (int)mres_delay_calc(&policy, 0, NULL));
-    ASSERT_EQ(200, (int)mres_delay_calc(&policy, 1, NULL));
-    ASSERT_EQ(200, (int)mres_delay_calc(&policy, 4, NULL));
+    CHECK_ERR(MRES_OK, mres_breaker_init(&breaker, &policy));
+    CHECK_ERR(MRES_ERR_OP_FAILED, mres_breaker_call(&breaker, op_fails, &op, &platform, NULL));
+    CHECK_U32(1u, breaker.state);
+
+    CHECK_ERR(MRES_OK, mres_breaker_report_success(&breaker));
+    CHECK_U32(MRES_BREAKER_OPEN, breaker.state);
+
+    CHECK_ERR(MRES_OK, mres_breaker_report_failure(&breaker, &platform));
+    CHECK_U32(100u, breaker.opened_at_ms);
+
+    CHECK_ERR(MRES_OK, mres_breaker_remaining_ms(&breaker, &platform, &remaining_ms, &is_open));
+    CHECK_BOOL(true, is_open);
+    CHECK_U32(50u, remaining_ms);
+
+    clock.now_ms = 160u;
+    CHECK_ERR(MRES_OK, mres_breaker_remaining_ms(&breaker, &platform, &remaining_ms, &is_open));
+    CHECK_BOOL(true, is_open);
+    CHECK_U32(0u, remaining_ms);
+    return true;
 }
 
-TEST(test_delay_linear) {
-    mres_retry_policy_t policy = { .max_attempts = 5, .base_delay_ms = 100,
-                                   .strategy = MRES_BACKOFF_LINEAR, .jitter = false };
-    ASSERT_EQ(100, (int)mres_delay_calc(&policy, 0, NULL));   /* 100 * 1 */
-    ASSERT_EQ(200, (int)mres_delay_calc(&policy, 1, NULL));   /* 100 * 2 */
-    ASSERT_EQ(300, (int)mres_delay_calc(&policy, 2, NULL));   /* 100 * 3 */
+static bool test_breaker_same_instance_recursion_and_policy_copy(void)
+{
+    mres_breaker_t breaker;
+    mock_clock_t clock = { 100u, 0u, 0, 0, NULL, NULL, NULL };
+    mock_op_t op = { 0, 0, 0, NULL, &breaker, NULL };
+    mres_platform_t platform = { &clock, mock_clock_now, mock_wait_fn };
+    mres_breaker_policy_t policy = breaker_policy(2u, 50u);
+
+    op.platform_for_reentry = &platform;
+
+    CHECK_ERR(MRES_OK, mres_breaker_init(&breaker, &policy));
+    policy.failure_threshold = 9u;
+    CHECK_ERR(MRES_OK, mres_breaker_call(&breaker, breaker_reentrant_operation, &op, &platform,
+                                         NULL));
+    CHECK_U32(2u, breaker.policy.failure_threshold);
+    return true;
 }
 
-TEST(test_delay_exponential) {
-    mres_retry_policy_t policy = { .max_attempts = 5, .base_delay_ms = 100,
-                                   .strategy = MRES_BACKOFF_EXPONENTIAL, .jitter = false };
-    ASSERT_EQ(100,  (int)mres_delay_calc(&policy, 0, NULL));  /* 100 * 1 */
-    ASSERT_EQ(200,  (int)mres_delay_calc(&policy, 1, NULL));  /* 100 * 2 */
-    ASSERT_EQ(400,  (int)mres_delay_calc(&policy, 2, NULL));  /* 100 * 4 */
-    ASSERT_EQ(800,  (int)mres_delay_calc(&policy, 3, NULL));  /* 100 * 8 */
-    ASSERT_EQ(1600, (int)mres_delay_calc(&policy, 4, NULL));  /* 100 * 16 */
+static bool test_rate_limiter_policy_and_range(void)
+{
+    mres_ratelimit_t limiter;
+    mres_ratelimit_policy_t invalid = limiter_policy(1u, 0u, 1u);
+    mres_ratelimit_policy_t valid = limiter_policy(2u, 1u, 10u);
+    mock_clock_t clock = { 100u, 0u, 0, 0, NULL, NULL, NULL };
+    mres_platform_t platform = { &clock, mock_clock_now, mock_wait_fn };
+    bool allowed = true;
+
+    CHECK_ERR(MRES_ERR_INVALID, mres_ratelimit_init(&limiter, &invalid, &platform));
+    CHECK_ERR(MRES_OK, mres_ratelimit_init(&limiter, &valid, &platform));
+    CHECK_ERR(MRES_ERR_INVALID, mres_ratelimit_acquire(&limiter, 0u, &platform, &allowed));
+    CHECK_ERR(MRES_ERR_RANGE, mres_ratelimit_acquire(&limiter, 3u, &platform, &allowed));
+    return true;
 }
 
-TEST(test_delay_capped) {
-    mres_retry_policy_t policy = { .max_attempts = 10, .base_delay_ms = 1000,
-                                   .max_delay_ms = 5000,
-                                   .strategy = MRES_BACKOFF_EXPONENTIAL, .jitter = false };
-    /* 1000, 2000, 4000, 5000(capped), 5000, ... */
-    ASSERT_EQ(1000, (int)mres_delay_calc(&policy, 0, NULL));
-    ASSERT_EQ(2000, (int)mres_delay_calc(&policy, 1, NULL));
-    ASSERT_EQ(4000, (int)mres_delay_calc(&policy, 2, NULL));
-    ASSERT_EQ(5000, (int)mres_delay_calc(&policy, 3, NULL));
-    ASSERT_EQ(5000, (int)mres_delay_calc(&policy, 4, NULL));
+static bool test_rate_limiter_overflow_regression_and_remainder(void)
+{
+    mres_ratelimit_t limiter;
+    mres_ratelimit_policy_t overflow_policy = limiter_policy(100u, 65535u, 1u);
+    mres_ratelimit_policy_t remainder_policy = limiter_policy(5u, 2u, 10u);
+    mock_clock_t clock = { 0u, 0u, 0, 0, NULL, NULL, NULL };
+    mres_platform_t platform = { &clock, mock_clock_now, mock_wait_fn };
+    bool allowed = false;
+    uint16_t tokens = 0u;
+
+    CHECK_ERR(MRES_OK, mres_ratelimit_init(&limiter, &overflow_policy, &platform));
+    CHECK_ERR(MRES_OK, mres_ratelimit_acquire(&limiter, 100u, &platform, &allowed));
+    CHECK_BOOL(true, allowed);
+    clock.now_ms = 0xFFFEFFFFu;
+    CHECK_ERR(MRES_OK, mres_ratelimit_tokens(&limiter, &platform, &tokens));
+    CHECK_U16(100u, tokens);
+
+    CHECK_ERR(MRES_OK, mres_ratelimit_init(&limiter, &remainder_policy, &platform));
+    CHECK_ERR(MRES_OK, mres_ratelimit_acquire(&limiter, 5u, &platform, &allowed));
+    clock.now_ms = 25u;
+    CHECK_ERR(MRES_OK, mres_ratelimit_tokens(&limiter, &platform, &tokens));
+    CHECK_U16(4u, tokens);
+    CHECK_U32(20u, limiter.last_refill_ms);
+    return true;
 }
 
-TEST(test_delay_jitter_in_range) {
-    reset_mocks();
-    mres_retry_policy_t policy = { .max_attempts = 5, .base_delay_ms = 1000,
-                                   .max_delay_ms = 30000,
-                                   .strategy = MRES_BACKOFF_FIXED, .jitter = true };
-    /* ±25% of 1000 = 750..1250 */
-    for (int i = 0; i < 20; i++) {
-        mock_time_ms = (uint32_t)(1000 + i * 37);  /* vary seed */
-        uint32_t d = mres_delay_calc(&policy, 0, mock_clock);
-        ASSERT_GE(d, 750);
-        ASSERT_LE(d, 1250);
-    }
+static bool test_rate_limiter_wrap_and_policy_copy(void)
+{
+    mres_ratelimit_t limiter;
+    mock_clock_t clock = { UINT32_MAX - 5u, 0u, 0, 0, NULL, NULL, NULL };
+    mres_platform_t platform = { &clock, mock_clock_now, mock_wait_fn };
+    mres_ratelimit_policy_t policy = limiter_policy(4u, 1u, 10u);
+    uint16_t tokens = 0u;
+    bool allowed = false;
+
+    CHECK_ERR(MRES_OK, mres_ratelimit_init(&limiter, &policy, &platform));
+    CHECK_ERR(MRES_OK, mres_ratelimit_acquire(&limiter, 4u, &platform, &allowed));
+    CHECK_BOOL(true, allowed);
+
+    policy.max_tokens = 99u;
+    clock.now_ms = 8u;
+    CHECK_ERR(MRES_OK, mres_ratelimit_tokens(&limiter, &platform, &tokens));
+    CHECK_U16(1u, tokens);
+    CHECK_U16(4u, limiter.policy.max_tokens);
+    return true;
 }
 
-TEST(test_delay_null_policy) {
-    ASSERT_EQ(0, (int)mres_delay_calc(NULL, 0, NULL));
+static bool test_rate_limiter_same_instance_clock_recursion(void)
+{
+    mres_ratelimit_t limiter;
+    mres_ratelimit_policy_t policy = limiter_policy(2u, 1u, 10u);
+    mock_clock_t clock = { 100u, 0u, 0, 0, NULL, NULL, NULL };
+    mres_platform_t platform = { &clock, mock_clock_now, mock_wait_fn };
+    bool allowed = false;
+
+    CHECK_ERR(MRES_OK, mres_ratelimit_init(&limiter, &policy, &platform));
+    clock.limiter_for_reentry = &limiter;
+    clock.platform_for_reentry = &platform;
+    CHECK_ERR(MRES_OK, mres_ratelimit_acquire(&limiter, 1u, &platform, &allowed));
+    CHECK_BOOL(true, allowed);
+    return true;
 }
 
-/* ── Retry with sleep tracking ────────────────────────────────────────── */
-
-TEST(test_retry_fixed_sleep_total) {
-    reset_mocks(); reset_op();
-    mres_retry_policy_t policy = { .max_attempts = 4, .base_delay_ms = 100,
-                                   .strategy = MRES_BACKOFF_FIXED, .jitter = false };
-    mres_retry_t retry;
-    mres_retry_init(&retry, &policy);
-    mres_retry_exec(&retry, mock_op_fail, NULL, mock_clock, mock_sleep);
-    /* 3 sleeps (not after last attempt), each 100ms */
-    ASSERT_EQ(300, (int)total_sleep_ms);
+static bool test_error_strings(void)
+{
+    CHECK_STR("ok", mres_err_str(MRES_OK));
+    CHECK_STR("wait callback failed", mres_err_str(MRES_ERR_WAIT_FAILED));
+    CHECK_STR("unknown error", mres_err_str((mres_err_t)1234));
+    return true;
 }
 
-TEST(test_retry_no_sleep_fn) {
-    reset_mocks(); reset_op();
-    op_fail_until = 2;
-    mres_retry_policy_t policy = { .max_attempts = 5, .base_delay_ms = 100,
-                                   .strategy = MRES_BACKOFF_FIXED };
-    mres_retry_t retry;
-    mres_retry_init(&retry, &policy);
-    /* sleep = NULL → no blocking, but still retries */
-    ASSERT_EQ(MRES_OK, mres_retry_exec(&retry, mock_op_fail_then_succeed, NULL,
-                                         mock_clock, NULL));
-    ASSERT_EQ(3, op_call_count);
-}
+int main(void)
+{
+    printf("microres test suite\n");
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * Tests: Circuit Breaker
- * ═══════════════════════════════════════════════════════════════════════════ */
+    (void)run_test("retry policy validation", test_retry_policy_validation);
+    (void)run_test("retry policy copy and seed", test_retry_policy_copy_and_seed);
+    (void)run_test("retry arithmetic saturation", test_retry_arithmetic_saturation);
+    (void)run_test("retry wait contracts", test_retry_exec_wait_contracts);
+    (void)run_test("retry result domain", test_retry_exec_result_domain);
+    (void)run_test("retry same-instance recursion", test_retry_same_instance_recursion_and_reset);
+    (void)run_test("retry nested independent", test_retry_nested_independent_instances);
+    (void)run_test("breaker policy and queries", test_breaker_policy_and_state_queries);
+    (void)run_test("breaker fail closed and result", test_breaker_fail_closed_and_result_domain);
+    (void)run_test("breaker timing and manual report", test_breaker_open_timing_and_manual_report);
+    (void)run_test("breaker recursion and policy copy", test_breaker_same_instance_recursion_and_policy_copy);
+    (void)run_test("rate limiter policy and range", test_rate_limiter_policy_and_range);
+    (void)run_test("rate limiter overflow and remainder", test_rate_limiter_overflow_regression_and_remainder);
+    (void)run_test("rate limiter wrap and policy copy", test_rate_limiter_wrap_and_policy_copy);
+    (void)run_test("rate limiter clock recursion", test_rate_limiter_same_instance_clock_recursion);
+    (void)run_test("error strings", test_error_strings);
 
-TEST(test_breaker_init) {
-    mres_breaker_policy_t policy = { .failure_threshold = 3,
-                                     .recovery_timeout_ms = 5000,
-                                     .half_open_max_calls = 1 };
-    mres_breaker_t br;
-    ASSERT_EQ(MRES_OK, mres_breaker_init(&br, &policy));
-    ASSERT_EQ(MRES_BREAKER_CLOSED, mres_breaker_state(&br));
-}
-
-TEST(test_breaker_init_null) {
-    mres_breaker_policy_t policy = { .failure_threshold = 3 };
-    mres_breaker_t br;
-    ASSERT_EQ(MRES_ERR_NULL, mres_breaker_init(NULL, &policy));
-    ASSERT_EQ(MRES_ERR_NULL, mres_breaker_init(&br, NULL));
-}
-
-TEST(test_breaker_init_zero_threshold) {
-    mres_breaker_policy_t policy = { .failure_threshold = 0 };
-    mres_breaker_t br;
-    ASSERT_EQ(MRES_ERR_INVALID, mres_breaker_init(&br, &policy));
-}
-
-TEST(test_breaker_passes_on_success) {
-    reset_mocks(); reset_op();
-    mres_breaker_policy_t policy = { .failure_threshold = 3,
-                                     .recovery_timeout_ms = 5000,
-                                     .half_open_max_calls = 1 };
-    mres_breaker_t br;
-    mres_breaker_init(&br, &policy);
-    ASSERT_EQ(MRES_OK, mres_breaker_call(&br, mock_op_succeed, NULL, mock_clock));
-    ASSERT_EQ(MRES_BREAKER_CLOSED, br.state);
-}
-
-TEST(test_breaker_trips_after_threshold) {
-    reset_mocks(); reset_op();
-    mres_breaker_policy_t policy = { .failure_threshold = 3,
-                                     .recovery_timeout_ms = 5000,
-                                     .half_open_max_calls = 1 };
-    mres_breaker_t br;
-    mres_breaker_init(&br, &policy);
-
-    mres_breaker_call(&br, mock_op_fail, NULL, mock_clock);  /* failure 1 */
-    ASSERT_EQ(MRES_BREAKER_CLOSED, br.state);
-    mres_breaker_call(&br, mock_op_fail, NULL, mock_clock);  /* failure 2 */
-    ASSERT_EQ(MRES_BREAKER_CLOSED, br.state);
-    mres_breaker_call(&br, mock_op_fail, NULL, mock_clock);  /* failure 3 → OPEN */
-    ASSERT_EQ(MRES_BREAKER_OPEN, br.state);
-}
-
-TEST(test_breaker_blocks_when_open) {
-    reset_mocks(); reset_op();
-    mres_breaker_policy_t policy = { .failure_threshold = 1,
-                                     .recovery_timeout_ms = 5000,
-                                     .half_open_max_calls = 1 };
-    mres_breaker_t br;
-    mres_breaker_init(&br, &policy);
-
-    mres_breaker_call(&br, mock_op_fail, NULL, mock_clock);  /* → OPEN */
-    ASSERT_EQ(MRES_BREAKER_OPEN, br.state);
-
-    reset_op();
-    int result = mres_breaker_call(&br, mock_op_succeed, NULL, mock_clock);
-    ASSERT_EQ(MRES_ERR_OPEN, result);
-    ASSERT_EQ(0, op_call_count);  /* op was NOT called */
-}
-
-TEST(test_breaker_success_resets_count) {
-    reset_mocks(); reset_op();
-    mres_breaker_policy_t policy = { .failure_threshold = 3,
-                                     .recovery_timeout_ms = 5000,
-                                     .half_open_max_calls = 1 };
-    mres_breaker_t br;
-    mres_breaker_init(&br, &policy);
-
-    mres_breaker_call(&br, mock_op_fail, NULL, mock_clock);  /* failure 1 */
-    mres_breaker_call(&br, mock_op_fail, NULL, mock_clock);  /* failure 2 */
-    mres_breaker_call(&br, mock_op_succeed, NULL, mock_clock); /* success resets */
-    ASSERT_EQ(0, br.failure_count);
-    ASSERT_EQ(MRES_BREAKER_CLOSED, br.state);
-}
-
-TEST(test_breaker_recovery_to_half_open) {
-    reset_mocks(); reset_op();
-    mres_breaker_policy_t policy = { .failure_threshold = 1,
-                                     .recovery_timeout_ms = 5000,
-                                     .half_open_max_calls = 1 };
-    mres_breaker_t br;
-    mres_breaker_init(&br, &policy);
-
-    mres_breaker_call(&br, mock_op_fail, NULL, mock_clock);  /* → OPEN */
-    ASSERT_EQ(MRES_BREAKER_OPEN, br.state);
-
-    /* Advance time past recovery timeout */
-    mock_time_ms += 6000;
-
-    reset_op();
-    /* Next call should transition to HALF_OPEN and execute */
-    mres_breaker_call(&br, mock_op_succeed, NULL, mock_clock);
-    ASSERT_EQ(MRES_BREAKER_CLOSED, br.state);  /* success → CLOSED */
-    ASSERT_EQ(1, op_call_count);
-}
-
-TEST(test_breaker_half_open_failure_reopens) {
-    reset_mocks(); reset_op();
-    mres_breaker_policy_t policy = { .failure_threshold = 1,
-                                     .recovery_timeout_ms = 5000,
-                                     .half_open_max_calls = 1 };
-    mres_breaker_t br;
-    mres_breaker_init(&br, &policy);
-
-    mres_breaker_call(&br, mock_op_fail, NULL, mock_clock);  /* → OPEN */
-    mock_time_ms += 6000;
-
-    /* Probe call fails → back to OPEN */
-    mres_breaker_call(&br, mock_op_fail, NULL, mock_clock);
-    ASSERT_EQ(MRES_BREAKER_OPEN, br.state);
-}
-
-TEST(test_breaker_remaining_ms) {
-    reset_mocks(); reset_op();
-    mres_breaker_policy_t policy = { .failure_threshold = 1,
-                                     .recovery_timeout_ms = 5000,
-                                     .half_open_max_calls = 1 };
-    mres_breaker_t br;
-    mres_breaker_init(&br, &policy);
-
-    mres_breaker_call(&br, mock_op_fail, NULL, mock_clock);  /* → OPEN */
-    mock_time_ms += 2000;
-    ASSERT_EQ(3000, (int)mres_breaker_remaining_ms(&br, mock_clock));
-
-    mock_time_ms += 3000;
-    ASSERT_EQ(0, (int)mres_breaker_remaining_ms(&br, mock_clock));
-}
-
-TEST(test_breaker_remaining_ms_not_open) {
-    mres_breaker_policy_t policy = { .failure_threshold = 3,
-                                     .recovery_timeout_ms = 5000,
-                                     .half_open_max_calls = 1 };
-    mres_breaker_t br;
-    mres_breaker_init(&br, &policy);
-    ASSERT_EQ(0, (int)mres_breaker_remaining_ms(&br, mock_clock));
-}
-
-TEST(test_breaker_reset) {
-    reset_mocks(); reset_op();
-    mres_breaker_policy_t policy = { .failure_threshold = 1,
-                                     .recovery_timeout_ms = 5000,
-                                     .half_open_max_calls = 1 };
-    mres_breaker_t br;
-    mres_breaker_init(&br, &policy);
-    mres_breaker_call(&br, mock_op_fail, NULL, mock_clock);
-    ASSERT_EQ(MRES_BREAKER_OPEN, br.state);
-
-    mres_breaker_reset(&br);
-    ASSERT_EQ(MRES_BREAKER_CLOSED, br.state);
-    ASSERT_EQ(0, br.failure_count);
-}
-
-TEST(test_breaker_state_name) {
-    mres_breaker_policy_t policy = { .failure_threshold = 1,
-                                     .recovery_timeout_ms = 5000,
-                                     .half_open_max_calls = 1 };
-    mres_breaker_t br;
-    mres_breaker_init(&br, &policy);
-    ASSERT_STR_EQ("CLOSED", mres_breaker_state_name(&br));
-
-    br.state = MRES_BREAKER_OPEN;
-    ASSERT_STR_EQ("OPEN", mres_breaker_state_name(&br));
-
-    br.state = MRES_BREAKER_HALF_OPEN;
-    ASSERT_STR_EQ("HALF_OPEN", mres_breaker_state_name(&br));
-}
-
-TEST(test_breaker_report_success) {
-    reset_mocks();
-    mres_breaker_policy_t policy = { .failure_threshold = 3,
-                                     .recovery_timeout_ms = 5000,
-                                     .half_open_max_calls = 1 };
-    mres_breaker_t br;
-    mres_breaker_init(&br, &policy);
-    br.failure_count = 2;
-    mres_breaker_report_success(&br);
-    ASSERT_EQ(0, br.failure_count);
-}
-
-TEST(test_breaker_report_failure) {
-    reset_mocks();
-    mres_breaker_policy_t policy = { .failure_threshold = 2,
-                                     .recovery_timeout_ms = 5000,
-                                     .half_open_max_calls = 1 };
-    mres_breaker_t br;
-    mres_breaker_init(&br, &policy);
-
-    mres_breaker_report_failure(&br, mock_clock);
-    ASSERT_EQ(1, br.failure_count);
-    ASSERT_EQ(MRES_BREAKER_CLOSED, br.state);
-
-    mres_breaker_report_failure(&br, mock_clock);
-    ASSERT_EQ(MRES_BREAKER_OPEN, br.state);
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * Tests: Rate Limiter
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-TEST(test_ratelimit_init) {
-    reset_mocks();
-    mres_ratelimit_policy_t policy = { .max_tokens = 10, .refill_ms = 1000,
-                                       .refill_count = 10 };
-    mres_ratelimit_t rl;
-    ASSERT_EQ(MRES_OK, mres_ratelimit_init(&rl, &policy, mock_clock));
-    ASSERT_EQ(10, rl.tokens);
-}
-
-TEST(test_ratelimit_init_null) {
-    reset_mocks();
-    mres_ratelimit_policy_t policy = { .max_tokens = 10, .refill_ms = 1000,
-                                       .refill_count = 10 };
-    mres_ratelimit_t rl;
-    ASSERT_EQ(MRES_ERR_NULL, mres_ratelimit_init(NULL, &policy, mock_clock));
-    ASSERT_EQ(MRES_ERR_NULL, mres_ratelimit_init(&rl, NULL, mock_clock));
-    ASSERT_EQ(MRES_ERR_NULL, mres_ratelimit_init(&rl, &policy, NULL));
-}
-
-TEST(test_ratelimit_init_invalid) {
-    reset_mocks();
-    mres_ratelimit_policy_t p1 = { .max_tokens = 0, .refill_ms = 1000, .refill_count = 1 };
-    mres_ratelimit_policy_t p2 = { .max_tokens = 10, .refill_ms = 0, .refill_count = 1 };
-    mres_ratelimit_t rl;
-    ASSERT_EQ(MRES_ERR_INVALID, mres_ratelimit_init(&rl, &p1, mock_clock));
-    ASSERT_EQ(MRES_ERR_INVALID, mres_ratelimit_init(&rl, &p2, mock_clock));
-}
-
-TEST(test_ratelimit_acquire_basic) {
-    reset_mocks();
-    mres_ratelimit_policy_t policy = { .max_tokens = 3, .refill_ms = 1000,
-                                       .refill_count = 3 };
-    mres_ratelimit_t rl;
-    mres_ratelimit_init(&rl, &policy, mock_clock);
-
-    ASSERT_TRUE(mres_ratelimit_acquire(&rl, 1, mock_clock));   /* 3→2 */
-    ASSERT_TRUE(mres_ratelimit_acquire(&rl, 1, mock_clock));   /* 2→1 */
-    ASSERT_TRUE(mres_ratelimit_acquire(&rl, 1, mock_clock));   /* 1→0 */
-    ASSERT_FALSE(mres_ratelimit_acquire(&rl, 1, mock_clock));  /* 0, blocked */
-}
-
-TEST(test_ratelimit_refill) {
-    reset_mocks();
-    mres_ratelimit_policy_t policy = { .max_tokens = 5, .refill_ms = 1000,
-                                       .refill_count = 2 };
-    mres_ratelimit_t rl;
-    mres_ratelimit_init(&rl, &policy, mock_clock);
-
-    /* Consume all */
-    for (int i = 0; i < 5; i++) {
-        mres_ratelimit_acquire(&rl, 1, mock_clock);
-    }
-    ASSERT_EQ(0, rl.tokens);
-
-    /* Advance 1 second → refill 2 tokens */
-    mock_time_ms += 1000;
-    ASSERT_TRUE(mres_ratelimit_acquire(&rl, 1, mock_clock));
-    ASSERT_EQ(1, rl.tokens);  /* 2 refilled, 1 consumed = 1 */
-}
-
-TEST(test_ratelimit_refill_capped) {
-    reset_mocks();
-    mres_ratelimit_policy_t policy = { .max_tokens = 5, .refill_ms = 1000,
-                                       .refill_count = 100 };
-    mres_ratelimit_t rl;
-    mres_ratelimit_init(&rl, &policy, mock_clock);
-
-    /* Consume all, then wait */
-    for (int i = 0; i < 5; i++) {
-        mres_ratelimit_acquire(&rl, 1, mock_clock);
-    }
-    mock_time_ms += 5000;
-
-    /* Should be capped at max_tokens */
-    uint16_t tokens = mres_ratelimit_tokens(&rl, mock_clock);
-    ASSERT_EQ(5, tokens);
-}
-
-TEST(test_ratelimit_multi_acquire) {
-    reset_mocks();
-    mres_ratelimit_policy_t policy = { .max_tokens = 10, .refill_ms = 1000,
-                                       .refill_count = 10 };
-    mres_ratelimit_t rl;
-    mres_ratelimit_init(&rl, &policy, mock_clock);
-
-    ASSERT_TRUE(mres_ratelimit_acquire(&rl, 5, mock_clock));   /* 10→5 */
-    ASSERT_TRUE(mres_ratelimit_acquire(&rl, 5, mock_clock));   /* 5→0 */
-    ASSERT_FALSE(mres_ratelimit_acquire(&rl, 1, mock_clock));  /* 0, blocked */
-}
-
-TEST(test_ratelimit_reset) {
-    reset_mocks();
-    mres_ratelimit_policy_t policy = { .max_tokens = 5, .refill_ms = 1000,
-                                       .refill_count = 5 };
-    mres_ratelimit_t rl;
-    mres_ratelimit_init(&rl, &policy, mock_clock);
-    mres_ratelimit_acquire(&rl, 5, mock_clock);
-    ASSERT_EQ(0, rl.tokens);
-
-    mres_ratelimit_reset(&rl, mock_clock);
-    ASSERT_EQ(5, rl.tokens);
-}
-
-TEST(test_ratelimit_tokens_query) {
-    reset_mocks();
-    mres_ratelimit_policy_t policy = { .max_tokens = 10, .refill_ms = 1000,
-                                       .refill_count = 5 };
-    mres_ratelimit_t rl;
-    mres_ratelimit_init(&rl, &policy, mock_clock);
-    mres_ratelimit_acquire(&rl, 3, mock_clock);
-    ASSERT_EQ(7, mres_ratelimit_tokens(&rl, mock_clock));
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * Tests: Error strings
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-TEST(test_err_str) {
-    ASSERT_STR_EQ("ok",                   mres_err_str(MRES_OK));
-    ASSERT_STR_EQ("null pointer",         mres_err_str(MRES_ERR_NULL));
-    ASSERT_STR_EQ("retries exhausted",    mres_err_str(MRES_ERR_EXHAUSTED));
-    ASSERT_STR_EQ("circuit breaker open", mres_err_str(MRES_ERR_OPEN));
-    ASSERT_STR_EQ("rate limited",         mres_err_str(MRES_ERR_RATE_LIMITED));
-    ASSERT_STR_EQ("operation failed",     mres_err_str(MRES_ERR_OP_FAILED));
-    ASSERT_STR_EQ("invalid configuration", mres_err_str(MRES_ERR_INVALID));
-    ASSERT_STR_EQ("unknown error",        mres_err_str((mres_err_t)99));
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * Main
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-int main(void) {
-    printf("\n=== microres test suite ===\n\n");
-
-    printf("[Retry - Init]\n");
-    RUN_TEST(test_retry_init);
-    RUN_TEST(test_retry_init_null);
-    RUN_TEST(test_retry_init_zero_attempts);
-
-    printf("\n[Retry - Execution]\n");
-    RUN_TEST(test_retry_success_first_attempt);
-    RUN_TEST(test_retry_success_after_failures);
-    RUN_TEST(test_retry_exhausted);
-    RUN_TEST(test_retry_single_attempt);
-    RUN_TEST(test_retry_reset);
-    RUN_TEST(test_retry_fixed_sleep_total);
-    RUN_TEST(test_retry_no_sleep_fn);
-
-    printf("\n[Retry - Delay Calculation]\n");
-    RUN_TEST(test_delay_fixed);
-    RUN_TEST(test_delay_linear);
-    RUN_TEST(test_delay_exponential);
-    RUN_TEST(test_delay_capped);
-    RUN_TEST(test_delay_jitter_in_range);
-    RUN_TEST(test_delay_null_policy);
-
-    printf("\n[Circuit Breaker - Init]\n");
-    RUN_TEST(test_breaker_init);
-    RUN_TEST(test_breaker_init_null);
-    RUN_TEST(test_breaker_init_zero_threshold);
-
-    printf("\n[Circuit Breaker - Behaviour]\n");
-    RUN_TEST(test_breaker_passes_on_success);
-    RUN_TEST(test_breaker_trips_after_threshold);
-    RUN_TEST(test_breaker_blocks_when_open);
-    RUN_TEST(test_breaker_success_resets_count);
-    RUN_TEST(test_breaker_recovery_to_half_open);
-    RUN_TEST(test_breaker_half_open_failure_reopens);
-    RUN_TEST(test_breaker_remaining_ms);
-    RUN_TEST(test_breaker_remaining_ms_not_open);
-    RUN_TEST(test_breaker_reset);
-    RUN_TEST(test_breaker_state_name);
-    RUN_TEST(test_breaker_report_success);
-    RUN_TEST(test_breaker_report_failure);
-
-    printf("\n[Rate Limiter - Init]\n");
-    RUN_TEST(test_ratelimit_init);
-    RUN_TEST(test_ratelimit_init_null);
-    RUN_TEST(test_ratelimit_init_invalid);
-
-    printf("\n[Rate Limiter - Behaviour]\n");
-    RUN_TEST(test_ratelimit_acquire_basic);
-    RUN_TEST(test_ratelimit_refill);
-    RUN_TEST(test_ratelimit_refill_capped);
-    RUN_TEST(test_ratelimit_multi_acquire);
-    RUN_TEST(test_ratelimit_reset);
-    RUN_TEST(test_ratelimit_tokens_query);
-
-    printf("\n[Error Strings]\n");
-    RUN_TEST(test_err_str);
-
-    printf("\n=== Results: %d/%d passed", tests_passed, tests_run);
-    if (tests_failed > 0) printf(", %d FAILED", tests_failed);
-    printf(" ===\n\n");
-
-    return tests_failed > 0 ? 1 : 0;
+    printf("results: %d run, %d passed, %d failed\n",
+           g_totals.run, g_totals.passed, g_totals.failed);
+    return (g_totals.failed == 0) ? 0 : 1;
 }
