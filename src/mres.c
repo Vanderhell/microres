@@ -11,6 +11,11 @@
 #define MRES_RATELIMIT_MAGIC 0x4D52524Cu
 #define MRES_DEFAULT_JITTER_SEED 0x9E3779B9u
 
+static mres_err_t mres_validate_retry_policy(const mres_retry_policy_t *policy);
+static mres_err_t mres_validate_breaker_policy(const mres_breaker_policy_t *policy);
+static mres_err_t mres_validate_ratelimit_policy(const mres_ratelimit_policy_t *policy);
+static bool mres_breaker_state_valid(uint8_t state);
+
 #ifdef MRES_ASSERT
 #define MRES_DIAG_ASSERT(expr)                                                     \
     do {                                                                           \
@@ -106,6 +111,25 @@ static bool mres_ratelimit_is_ready(const mres_ratelimit_t *limiter)
 {
     return (limiter != NULL) && (limiter->magic == MRES_RATELIMIT_MAGIC) &&
            (limiter->initialized != 0u);
+}
+
+static bool mres_retry_is_busy_instance(const mres_retry_t *retry)
+{
+    return mres_retry_is_ready(retry) && (retry->active != 0u) &&
+           (mres_validate_retry_policy(&retry->policy) == MRES_OK);
+}
+
+static bool mres_breaker_is_busy_instance(const mres_breaker_t *breaker)
+{
+    return mres_breaker_is_ready(breaker) && (breaker->active != 0u) &&
+           mres_breaker_state_valid(breaker->state) &&
+           (mres_validate_breaker_policy(&breaker->policy) == MRES_OK);
+}
+
+static bool mres_ratelimit_is_busy_instance(const mres_ratelimit_t *limiter)
+{
+    return mres_ratelimit_is_ready(limiter) && (limiter->active != 0u) &&
+           (mres_validate_ratelimit_policy(&limiter->policy) == MRES_OK);
 }
 
 static mres_err_t mres_validate_retry_policy(const mres_retry_policy_t *policy)
@@ -383,7 +407,7 @@ mres_err_t mres_retry_init(mres_retry_t *retry, const mres_retry_policy_t *polic
         return MRES_ERR_NULL;
     }
 
-    if (mres_retry_is_ready(retry) && (retry->active != 0u)) {
+    if (mres_retry_is_busy_instance(retry)) {
         return MRES_ERR_BUSY;
     }
 
@@ -545,7 +569,7 @@ mres_err_t mres_breaker_init(mres_breaker_t *breaker, const mres_breaker_policy_
         return MRES_ERR_NULL;
     }
 
-    if (mres_breaker_is_ready(breaker) && (breaker->active != 0u)) {
+    if (mres_breaker_is_busy_instance(breaker)) {
         return MRES_ERR_BUSY;
     }
 
@@ -867,7 +891,7 @@ mres_err_t mres_ratelimit_init(
         return MRES_ERR_NULL;
     }
 
-    if (mres_ratelimit_is_ready(limiter) && (limiter->active != 0u)) {
+    if (mres_ratelimit_is_busy_instance(limiter)) {
         return MRES_ERR_BUSY;
     }
 
