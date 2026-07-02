@@ -2,7 +2,7 @@
 
 All notable changes to this project are documented here.
 
-## Unreleased
+## [1.0.0] - 2026-07-02
 
 ### Changed
 
@@ -15,4 +15,4 @@ All notable changes to this project are documented here.
 
 ### Release notes
 
-- no tag-backed release is recorded in this repository state
+- first tag-backed release for the audited contract rewrite
