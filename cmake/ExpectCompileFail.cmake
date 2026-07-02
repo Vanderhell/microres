@@ -44,6 +44,25 @@ if(compile_result EQUAL 0)
     message(FATAL_ERROR "compile-fail test ${CASE_NAME} unexpectedly compiled successfully")
 endif()
 
-if(NOT compile_output MATCHES "MRES_DIAG")
-    message(FATAL_ERROR "compile-fail test ${CASE_NAME} did not report the intended diagnostic")
+if(compile_output MATCHES "No such file or directory|cannot open source file|fatal error C1083")
+    message(FATAL_ERROR "compile-fail test ${CASE_NAME} failed for an unrelated missing-file reason:\n${compile_output}")
+endif()
+
+set(expected_pattern "MRES_DIAG")
+
+if(CASE_NAME STREQUAL "invalid_jitter")
+    set(expected_pattern "MRES_DIAG|MRES_ENABLE_JITTER")
+elseif(CASE_NAME STREQUAL "invalid_attempts")
+    set(expected_pattern "MRES_DIAG|MRES_MAX_ATTEMPTS")
+elseif(CASE_NAME STREQUAL "conflicting_generated_config")
+    set(expected_pattern "MRES_DIAG|MRES_CONFIG_ABI_REVISION|MRES_CONFIG_ABI")
+elseif(CASE_NAME STREQUAL "unsupported_abi_change")
+    set(expected_pattern "MRES_DIAG|MRES_USE_BOOL_FIELDS|ABI_CHANGE")
+endif()
+
+if(NOT compile_output MATCHES "${expected_pattern}")
+    message(FATAL_ERROR
+        "compile-fail test ${CASE_NAME} did not report the intended diagnostic.\n"
+        "Expected pattern: ${expected_pattern}\n"
+        "Output:\n${compile_output}")
 endif()
