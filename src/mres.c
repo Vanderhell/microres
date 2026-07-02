@@ -119,9 +119,11 @@ static mres_err_t mres_validate_retry_policy(const mres_retry_policy_t *policy)
         return MRES_ERR_INVALID;
     }
 
+#if (MRES_MAX_ATTEMPTS < UINT8_MAX)
     if (policy->max_attempts > (uint8_t)MRES_MAX_ATTEMPTS) {
         return MRES_ERR_RANGE;
     }
+#endif
 
     if ((policy->strategy != MRES_BACKOFF_FIXED) &&
         (policy->strategy != MRES_BACKOFF_LINEAR) &&

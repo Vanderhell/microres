@@ -112,13 +112,14 @@ jobs:
           cmake --build consumer-build --parallel
 
   windows-msvc:
-    runs-on: windows-latest
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
       - name: Configure
-        run: cmake -S . -B build -DMRES_BUILD_TESTS=ON -G "Visual Studio 17 2022" -A x64
+        run: cmake -S . -B build -DMRES_BUILD_TESTS=ON -G Ninja -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl
       - name: Build
-        run: cmake --build build --config Release
+        run: cmake --build build --parallel
 
   arm-compile:
     runs-on: ubuntu-latest

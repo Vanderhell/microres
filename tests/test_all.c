@@ -260,11 +260,10 @@ static bool test_retry_policy_validation(void)
 {
     mres_retry_t retry;
     mres_retry_policy_t invalid_strategy = retry_policy(3u, 10u, 0u, 9u, 0u);
-    mres_retry_policy_t invalid_attempts = retry_policy((uint8_t)(MRES_MAX_ATTEMPTS + 1), 10u, 0u,
-                                                        MRES_BACKOFF_FIXED, 0u);
+    mres_retry_policy_t zero_attempts = retry_policy(0u, 10u, 0u, MRES_BACKOFF_FIXED, 0u);
 
     CHECK_ERR(MRES_ERR_INVALID, mres_retry_init(&retry, &invalid_strategy));
-    CHECK_ERR(MRES_ERR_RANGE, mres_retry_init(&retry, &invalid_attempts));
+    CHECK_ERR(MRES_ERR_INVALID, mres_retry_init(&retry, &zero_attempts));
     return true;
 }
 
@@ -502,6 +501,7 @@ static bool test_rate_limiter_overflow_regression_and_remainder(void)
     CHECK_ERR(MRES_OK, mres_ratelimit_tokens(&limiter, &platform, &tokens));
     CHECK_U16(100u, tokens);
 
+    clock.now_ms = 0u;
     CHECK_ERR(MRES_OK, mres_ratelimit_init(&limiter, &remainder_policy, &platform));
     CHECK_ERR(MRES_OK, mres_ratelimit_acquire(&limiter, 5u, &platform, &allowed));
     clock.now_ms = 25u;

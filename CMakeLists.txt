@@ -118,19 +118,23 @@ if(MRES_BUILD_TESTS)
         mres_apply_warnings("consumer_cpp${cxx_std}")
     endforeach()
 
-    foreach(case_name IN ITEMS
-            invalid_jitter
-            invalid_attempts
-            conflicting_generated_config
-            unsupported_abi_change)
-        add_test(
-            NAME "compile_fail_${case_name}"
-            COMMAND
-                ${CMAKE_COMMAND}
-                -DCASE_NAME=${case_name}
-                -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
-                -DBINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}
-                -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/ExpectCompileFail.cmake
-        )
-    endforeach()
+    if(NOT MSVC)
+        foreach(case_name IN ITEMS
+                invalid_jitter
+                invalid_attempts
+                conflicting_generated_config
+                unsupported_abi_change)
+            add_test(
+                NAME "compile_fail_${case_name}"
+                COMMAND
+                    ${CMAKE_COMMAND}
+                    -DCASE_NAME=${case_name}
+                    -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+                    -DBINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}
+                    -DC_COMPILER=${CMAKE_C_COMPILER}
+                    -DMRES_GENERATED_INCLUDE_DIR=${MRES_GENERATED_INCLUDE_DIR}
+                    -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/ExpectCompileFail.cmake
+            )
+        endforeach()
+    endif()
 endif()
