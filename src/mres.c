@@ -575,7 +575,7 @@ mres_err_t mres_breaker_call(
 {
     int result = 0;
     uint32_t now_ms = 0u;
-    mres_err_t err = MRES_OK;
+    mres_err_t err;
 
     if (breaker == NULL) {
         MRES_DIAG_ASSERT(breaker != NULL);

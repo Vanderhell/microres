@@ -489,23 +489,24 @@ static bool test_rate_limiter_overflow_regression_and_remainder(void)
     mres_ratelimit_t limiter;
     mres_ratelimit_policy_t overflow_policy = limiter_policy(100u, 65535u, 1u);
     mres_ratelimit_policy_t remainder_policy = limiter_policy(5u, 2u, 10u);
-    mock_clock_t clock = { 0u, 0u, 0, 0, NULL, NULL, NULL };
-    mres_platform_t platform = { &clock, mock_clock_now, mock_wait_fn };
+    mock_clock_t overflow_clock = { 0u, 0u, 0, 0, NULL, NULL, NULL };
+    mock_clock_t remainder_clock = { 0u, 0u, 0, 0, NULL, NULL, NULL };
+    mres_platform_t overflow_platform = { &overflow_clock, mock_clock_now, mock_wait_fn };
+    mres_platform_t remainder_platform = { &remainder_clock, mock_clock_now, mock_wait_fn };
     bool allowed = false;
     uint16_t tokens = 0u;
 
-    CHECK_ERR(MRES_OK, mres_ratelimit_init(&limiter, &overflow_policy, &platform));
-    CHECK_ERR(MRES_OK, mres_ratelimit_acquire(&limiter, 100u, &platform, &allowed));
+    CHECK_ERR(MRES_OK, mres_ratelimit_init(&limiter, &overflow_policy, &overflow_platform));
+    CHECK_ERR(MRES_OK, mres_ratelimit_acquire(&limiter, 100u, &overflow_platform, &allowed));
     CHECK_BOOL(true, allowed);
-    clock.now_ms = 0xFFFEFFFFu;
-    CHECK_ERR(MRES_OK, mres_ratelimit_tokens(&limiter, &platform, &tokens));
+    overflow_clock.now_ms = 0xFFFEFFFFu;
+    CHECK_ERR(MRES_OK, mres_ratelimit_tokens(&limiter, &overflow_platform, &tokens));
     CHECK_U16(100u, tokens);
 
-    clock.now_ms = 0u;
-    CHECK_ERR(MRES_OK, mres_ratelimit_init(&limiter, &remainder_policy, &platform));
-    CHECK_ERR(MRES_OK, mres_ratelimit_acquire(&limiter, 5u, &platform, &allowed));
-    clock.now_ms = 25u;
-    CHECK_ERR(MRES_OK, mres_ratelimit_tokens(&limiter, &platform, &tokens));
+    CHECK_ERR(MRES_OK, mres_ratelimit_init(&limiter, &remainder_policy, &remainder_platform));
+    CHECK_ERR(MRES_OK, mres_ratelimit_acquire(&limiter, 5u, &remainder_platform, &allowed));
+    remainder_clock.now_ms = 25u;
+    CHECK_ERR(MRES_OK, mres_ratelimit_tokens(&limiter, &remainder_platform, &tokens));
     CHECK_U16(4u, tokens);
     CHECK_U32(20u, limiter.last_refill_ms);
     return true;
